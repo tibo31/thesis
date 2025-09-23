@@ -1,0 +1,1124 @@
+---
+title: "Application for chapter 4 of the thesis"
+subtitle: "Covariates impacts in SAR models for CoDa"
+date: "Last update: `r Sys.Date()`"
+author: C. Thomas-Agnan, T. Laurent and A. Ruiz-Gazen
+header-includes:
+- \usepackage{booktabs}
+- \usepackage{makecell}
+output:
+  html_document:   
+  number_sections: yes
+---
+  
+  
+```{r setup, include=FALSE}
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+opts_chunk$set(fig.align = "center",
+               cache = F,
+               fig.width = 7,
+               fig.height = 6,
+               cache.lazy = FALSE
+)
+options(kableExtra.latex.load_packages = FALSE)
+```
+
+This document provides the R code used to reproduce the results presented in Chapter 4 of Thibault Laurent’s thesis.
+The methodological framework is based on the original article, but the empirical application has been adapted here to address the migration–climate context developed in the dissertation.
+The original codes corresponding to the published paper are available at:
+ https://github.com/tibo31/spatial_coda_elasticities
+
+Packages needed:
+  
+```{r, message = F, warning = F}
+library(cartography) # mapping
+library(compositions) # compositions data
+library(gridExtra) # several frame in ggplot
+library(Matrix)    # sparse matrix
+library(scatterpie) # plot several pie 
+library(sp) # spatial package sp
+library(spdep) # spatial econometrics
+library(sf) # spatial package sf
+library(tidyverse) # tidyverse universe 
+```
+
+
+# Import data
+
+## Flow data 
+
+We import first the flow data estimated in Chapter 1, using the optimal transport approach, which serve as the dependent variable in the spatial compositional regression models of Chapter 4.
+
+```{r}
+ load(file = "data/our_estimates_2024.RData")
+
+temp <- our_estimates_5y %>% 
+  filter(type == "tot",
+         year == "2020-2024") %>%
+  select(origin, dest, hat_transport_open_outwards, hat_transport_open_returns, hat_transport_open_transits)
+
+outflows <- temp %>%
+  group_by(origin) %>%
+  summarize(out_outwards = sum(hat_transport_open_outwards),
+            out_returns = sum(hat_transport_open_returns), 
+            out_transit = sum(hat_transport_open_transits)) %>%
+  mutate(out_total = out_outwards + out_returns + out_transit) %>%
+  rename(iso3 = origin)
+
+inflows <- temp %>%
+  group_by(dest) %>%
+  summarize(in_outwards = sum(hat_transport_open_outwards),
+            in_returns = sum(hat_transport_open_returns), 
+            in_transit = sum(hat_transport_open_transits)) %>%
+  mutate(in_total = in_outwards + in_returns + in_transit) %>%
+  rename(iso3 = dest)
+```
+
+
+
+## Spatial contours 
+
+We import the spatial contours of countries, which will be used to match the flow data with geographical units.
+
+```{r}
+my_proj <- '+proj=robin +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs'
+source(file = "data/Load_Geospatial_Data.R")
+sf_use_s2(F)
+world_sf <- GeoDATA %>%
+  rename(region = SIREGION, iso3 = ISO3)
+countries_regions <- world_sf %>%
+  rmapshaper::ms_simplify(, keep = 0.05, keep_shapes = T)
+# polygons with same country than UN data basis
+world <- st_transform(countries_regions, my_proj)
+world_union <- st_union(world)
+
+# contours, longitude and latitude of the map
+p1 <- rbind(c(-180, -90), 
+            c(180, -90),
+            cbind(180, seq(-90, 90, by = 1)),
+            c(180, 90),
+            c(-180, 90),
+            cbind(-180, seq(90, -90, by = -1)),
+            c(-180, -90))
+border_sf <- st_sfc(st_polygon(list(p1)))
+long_sf <- st_sfc(st_linestring(cbind(-150, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(-120, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(-90, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(-60, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(-30, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(0, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(150, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(120, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(90, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(60, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(30, seq(-90, 90, by = 1)))
+)
+lat_sf <- st_sfc(st_linestring(cbind(seq(-180, 180, by = 1), -60)),
+                  st_linestring(cbind(seq(-180, 180, by = 1), -30)),
+                  st_linestring(cbind(seq(-180, 180, by = 1), -0)),
+                  st_linestring(cbind(seq(-180, 180, by = 1), 30)),
+                  st_linestring(cbind(seq(-180, 180, by = 1), 60))
+)
+# Coordinate Reference System
+st_crs(border_sf) <- 4326
+st_crs(long_sf) <- 4326
+st_crs(lat_sf) <- 4326
+border_sf <- st_transform(border_sf, my_proj)
+long_sf <- st_transform(long_sf, my_proj)
+lat_sf <- st_transform(lat_sf, my_proj)
+sea <- st_difference(border_sf, world_union)
+```
+
+
+```{r, fig.width = 10, fig.height = 5}
+plot(sea, col = "lightblue", border = rgb(0.2, 0.2, 0.2))
+plot(long_sf, add = T, col = "lightgrey")
+plot(lat_sf, add = T, col = "lightgrey")
+```
+
+We create the object that will gather all variables,  
+combining the covariates imported previously with the new stock-based indicators.  
+
+```{r}
+world_iso_3 <- merge(world, outflows, by = "iso3")
+world_iso_3 <- merge(world_iso_3, inflows, by = "iso3")
+```
+
+## Explanatory variables  
+
+We import the same set of covariates as in Chapter 3,  
+so that the analysis remains comparable across chapters.  
+
+```{r}
+load("data/covariates.RData")
+world_iso_3 <- merge(world_iso_3, my_X[, -c(2:37)], by = "iso3")
+world_iso_3$class_conflict <- factor(world_iso_3$class_conflict, 
+                      levels = c("low", "medium", "high", "very high"))
+```
+
+We add a new variable based on migration stocks,  
+namely the percentage of migrants residing in the country  
+and the percentage of nationals living abroad.  
+
+
+```{r}
+load("data/stock_tot_2020.RData")
+stock_info <- data.frame(
+  iso3 = colnames(s1), 
+  percent_foreign = 1 - diag(s1_open) / colSums(s1_open),
+  percent_outside = 1 - diag(s1_open) / rowSums(s1_open)
+)
+world_iso_3 <- merge(world_iso_3, stock_info, by = "iso3")
+```
+
+
+# Exploratory analysis  
+
+## Dependent variable  
+
+### Tricolore map
+
+We begin by exploring the dependent variable, which corresponds to the compositional structure of migration flows (outward, return, transit). Here, we reproduce Figure 4.6 of the article: a ternary diagram with colors and mapping, which provides a first visualization of the distribution of flows across the three components.
+
+
+```{r, fig.width = 13, fig.height = 4.35}
+library(compositions)
+A <- c(0, 0)
+B <- c(1, 0)
+C <- c(0.5, sqrt(3) / 2)
+
+# identify countries influenced by one composition 
+# out
+ind_belize <- 25
+ind_saudi <- 177
+ind_viet <- which(world_iso_3$SOVRN == "Viet Nam")
+temp_out <- world_iso_3[c(ind_belize, ind_saudi, ind_viet), ]
+
+ind_chad <- which(world_iso_3$SOVRN == "Chad")
+ind_cuba <- which(world_iso_3$SOVRN == "Cuba")
+ind_lebanon <- which(world_iso_3$SOVRN == "Lebanon")
+temp_in <- world_iso_3[c(ind_lebanon, ind_cuba, ind_chad), ]
+
+temp_compo <- st_drop_geometry(world_iso_3)
+
+# merge spatial data 
+for(s in c("out", "in")) {
+
+  s_3 <- temp_compo[, paste0(s, "_", c("outwards", "returns", "transit"))] /
+    temp_compo[, paste0(s, "_total")]
+  s_3[s_3 == 0] <- 0.01
+  acomp_s3 <- compositions::acomp(s_3)
+  names(acomp_s3) <- c("outwards", "returns", "transit")
+  n <- nrow(s_3)
+  s_3_mean <- acomp_s3[1, ] / n
+  for(k in 2:nrow(acomp_s3))
+    s_3_mean <- s_3_mean + acomp_s3[k, ] / n
+
+  s_3_centered <- as(acomp_s3, "matrix")
+
+  Y_simplex_x <- s_3_centered[, 1] * A[1] + s_3_centered[, 2] * B[1] + 
+    s_3_centered[, 3] * C[1]
+  Y_simplex_y <- s_3_centered[, 1] * A[2] + s_3_centered[, 2] * B[2] + 
+    s_3_centered[, 3] * C[2]
+
+#pdf(paste0("figures/coda_colors_", s , ".pdf"), 
+#    width = 13 * 0.8, height = 4.35 * 0.8)
+par(oma = c(0, 0, 0, 0), mfrow = c(1, 2))
+par(mar = c(0, 0, 0.3, 0))
+pal_col_ternary <- tricolore::Tricolore(data.frame(
+  outwards = c(0.7, 0.6, 0.4, 0.25, 0.05, 0.5, 0.25, 0.05, 0.25),
+  returns = c(0.25, 0.25, 0.25, 0.25, 0.25, 0.45, 0.45, 0.45, 0.7),
+  transit = c(0.05, 0.15, 0.35, 0.5, 0.7, 0.05, 0.2, 0.5, 0.05)),
+                     'outwards', 'returns', 'transit',
+                     hue = 0.2, breaks = 3)$rgb
+
+list_poly <- list(
+  list(x = c(0, 1/3, 1/6, 0),
+       y = c(0, 0, C[2] / 3, 0)),
+  list(x = c(1/6, 1/3, 1/2, 1/6),
+       y = c(C[2]/3, 0, C[2]/3, C[2]/3)), 
+  list(x = c(1/3, 2/3, 1/2, 1/3),
+       y = c(0, 0, C[2]/3, 0)), 
+  list(x = c(1/2, 2/3, 5/6, 1/2),
+       y = c(C[2]/3, 0, C[2]/3, C[2]/3)), 
+  list(x = c(2/3, 1, 5/6, 2/3),
+       y = c(0, 0, C[2]/3, 0)), 
+  list(x = c(1/6, 1/2, 1/3, 1/6),
+       y = c(C[2]/3, C[2]/3, 2*C[2]/3, C[2]/3)), 
+  list(x = c(1/3, 1/2, 2/3, 1/3),
+       y = c(2*C[2]/3, C[2]/3, 2*C[2]/3, 2*C[2]/3)), 
+  list(x = c(1/2, 5/6, 2/3, 1/2),
+       y = c(C[2]/3, C[2]/3, 2 * C[2]/3, C[2]/3)), 
+  list(x = c(1/3, 2/3, 1/2, 1/3),
+       y = c(2 * C[2]/3, 2 * C[2]/3,  C[2], 2 * C[2]/3))
+)
+  plot(rbind(A, B, C), xaxt = "n", yaxt = "n", frame = F,
+       type = "n", xlab = "", ylab = "", asp = 1, main = "",
+       ylim = c(-0.12, sqrt(3)/2), cex.main = 2)
+
+  for(l in 1:9) {
+    polygon(list_poly[[l]]$x, list_poly[[l]]$y, col = pal_col_ternary[l],
+            border = NULL, lty = 1, lwd = 0.1)
+}
+  points(Y_simplex_x, Y_simplex_y, col = "black",
+         cex = 0.4, pch = 16)
+
+  if(s == "out") {
+    points(Y_simplex_x[c(ind_belize, ind_saudi, ind_viet)], 
+         Y_simplex_y[c(ind_belize, ind_saudi, ind_viet)], 
+         col = "red",
+         cex = 0.6, pch = 16)
+  } else {
+    points(Y_simplex_x[c(ind_lebanon, ind_cuba, ind_chad)], 
+         Y_simplex_y[c(ind_lebanon, ind_cuba, ind_chad)], 
+         col = "red",
+         cex = 0.6, pch = 16)
+  }
+  text(c(0.04, 0.96, 1/2 - 0.1), c(0-0.12, -0.12, sqrt(3)/2 - 0.041),
+       c("Outward", "Return", "Transit"), pos = 3,
+       cex = 1, col = pal_col_ternary[c(1, 5, 9)])
+  lines(c(0, 1), c(0, 0), col = "black")
+  lines(c(0, 0.5), c(0, sqrt(3)/2), col = "black")
+  lines(c(1, 0.5), c(0, sqrt(3)/2), col = "black")
+
+  mtext(paste0("\t \t \t Compositions of ", s, "flows"), 
+        side = 2, line = -2, cex = 1.1)
+  # XR lines
+  my_labels <- c("1/3", "2/3")
+  for (k in 1:2) {
+     text(1-k/6, k/3 * C[2], my_labels[k], pos = 4, cex = 0.7, 
+           col = pal_col_ternary[c(9)])
+  }
+
+  # Left lines
+  for (k in 1:2) {
+    text(k/3, 0, my_labels[k], pos = 1, cex = 0.7, srt = 250, 
+           col = pal_col_ternary[c(5)])
+  }
+  # Right lines
+  for (k in 1:2) {
+    text(k * 1 / 6-0.01, k/3 * C[2], rev(my_labels)[k], pos = 3, cex = 0.7, srt = 135, 
+           col = pal_col_ternary[c(1)])
+  }
+
+new_col <-  tricolore::Tricolore(as(acomp_s3, "data.frame"),
+                     'outwards', 'transit','returns',
+                     hue = 0.2, breaks = 3)$rgb
+
+#####################################. 
+par(mar = c(0, 0, 0, 0))
+plot(sea, col = "lightblue", border = rgb(0.2, 0.2, 0.2))
+plot(long_sf, add = T, col = "lightgrey")
+plot(lat_sf, add = T, col = "lightgrey")
+plot(st_geometry(world_iso_3),  border = new_col, 
+     lwd = 0.2,
+     col = new_col, add = T)
+if(s == "out") {
+  plot(st_geometry(temp_out),  
+       border = "red", 
+       col = pal_col_ternary[c(9, 5, 1)], 
+       lwd = 0.5, add = T)
+  text(st_coordinates(st_centroid(temp_out))[, 1],  
+       st_coordinates(st_centroid(temp_out))[, 2],
+       temp_out$SOVRN, pos = 4, cex = 0.5)
+} else {
+   plot(st_geometry(temp_in),  
+       border = "red", 
+       col = pal_col_ternary[c(9, 5, 1)], 
+       lwd = 0.5, add = T)
+  text(st_coordinates(st_centroid(temp_in))[, 1],  
+       st_coordinates(st_centroid(temp_in))[, 2],
+       temp_in$SOVRN, pos = 4, cex = 0.5)
+}
+#dev.off()
+}
+```
+
+We now examine the countries with the highest shares of **outward** migration in their compositional structure.  This allows us to identify which origins contribute most strongly to departure flows.
+
+```{r, eval = F}
+temp_compo %>% 
+  mutate(out_outwards = out_outwards / out_total,
+         out_returns = out_returns / out_total,
+         out_transit = out_transit / out_total,
+         in_outwards = in_outwards / in_total,
+         in_returns = in_returns / in_total,
+         in_transit = in_transit / in_total) %>%
+  arrange(-out_outwards) %>% 
+  head(30)
+```
+
+
+### Barplot  
+
+As an alternative to the ternary diagram, we represent the compositions using barplots  
+(see Figure D.2 in the Appendix). This view highlights more clearly the relative weight of outward, return, and transit flows for each country.  
+
+```{r, fig.width = 30, fig.height = 6}
+# inflows
+temp_compo %>% 
+  mutate(in_outward = in_outwards / in_total, 
+         in_return = in_returns / in_total,
+         in_transit = in_transit / in_total) %>%
+  mutate(iso3 = fct_reorder(iso3, in_outward)) %>%
+  select(iso3, CONTINENT, in_outward, in_return, in_transit) %>%
+  pivot_longer(
+    cols = c("in_outward", "in_return", "in_transit"),
+    names_to = "type",
+    values_to = "share") %>%
+  mutate(type = substr(type, 4, nchar(type))) %>%
+  ggplot() +
+  geom_col(aes(x = iso3, fill = type, y = share)) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  xlab("Country") + ylab("Shares of migrants in inflows") + 
+  facet_grid(. ~ CONTINENT, scales = "free_x", space = "free", ) +
+  scale_fill_grey()
+ggsave("figures/barplot_in.pdf", width = 25, height = 5)
+
+# outflows
+temp_compo %>% 
+  mutate(out_outward = out_outwards / out_total, 
+         out_return = out_returns / out_total,
+         out_transit = out_transit / out_total) %>%
+  mutate(iso3 = fct_reorder(iso3, out_outward)) %>%
+  select(iso3, CONTINENT, out_outward, out_return, out_transit) %>%
+  pivot_longer(
+    cols = c("out_outward", "out_return", "out_transit"),
+    names_to = "type",
+    values_to = "share") %>%
+  mutate(type = substr(type, 4, nchar(type))) %>%
+  ggplot() +
+  geom_col(aes(x = iso3, fill = type, y = share)) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  xlab("Country") + ylab("Shares of migrants in outflows") +
+  facet_grid(. ~ CONTINENT, scales = "free_x", space = "free", ) +
+  scale_fill_grey()
+ggsave("figures/barplot_out.pdf", width = 25, height = 5)
+```
+
+
+
+## Spatial weight matrix  
+
+We represent the spatial weight matrix used in the analysis, which captures the neighborhood structure between countries.  
+
+
+```{r, warning = F, message = F}
+world_iso_3_agg <- world_iso_3
+world_iso_3_agg$iso3[world_iso_3_agg$iso3 == "ESH"] <- "MAR"
+world_iso_3_agg <- aggregate(world_iso_3_agg[, "iso3"], 
+          by = list(iso3 = world_iso_3_agg$iso3),
+          FUN = length)
+# fontiere Maroc / Sahara 
+frontiers <- st_intersection(world_iso_3[world_iso_3$iso3 == "MAR", ], 
+                world_iso_3[world_iso_3$iso3 == "ESH", ])
+```
+
+```{r, warning = F, message = F, fig.width = 10, fig.height =5}
+my_centroid <- st_as_sf(data.frame(
+  long = world_iso_3$Centroid_of_LARGEST_POLYGON_X,
+  lat = world_iso_3$Centroid_of_LARGEST_POLYGON_Y,
+  iso3 = world_iso_3$iso3),
+  coords = c("long", "lat"),
+  crs = 4326)
+
+# based on contiguity + 3 neighbours
+nb_out <- union.nb(poly2nb(world_iso_3),
+                   knn2nb(knearneigh(my_centroid, k = 3)))
+OW <- nb2mat(nb_out)
+crs_robin <- st_crs(world_iso_3)
+neighbours_sf <- st_as_sf(nb2lines(nb_out,
+            coords =  st_coordinates(st_centroid(world_iso_3))))
+st_crs(neighbours_sf) <- crs_robin
+long_sf_180 <- st_sfc(st_linestring(cbind(-180, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(180, seq(-90, 90, by = 1))),
+                  crs = 4326
+)
+long_sf_180 <- st_transform(long_sf_180, crs_robin)
+
+ind_big <- which(as.numeric(st_length(neighbours_sf)) > 10^7)
+
+#pdf("figures/spatial_weight.pdf", width = 10, height =5)
+par(oma = c(0, 0, 0, 0), mar = c(0, 0, 0, 0))
+plot(st_geometry(world_iso_3_agg), border = "lightgrey",
+     ylim = c(-7*10^6, 7*10^6))
+plot(st_geometry(frontiers), add = T, col = "lightgrey",
+     lty = 3)
+plot(st_geometry(sea), col = "lightblue", add = T)
+plot(st_geometry(neighbours_sf[-ind_big, ]), col = "darkred",
+     add =T, lwd = 0.8)
+
+for(l in 1:length(ind_big)) {
+   
+# point 1
+x_pt_1 <- neighbours_sf[ind_big[l], ]$geometry[[1]][1, 1]
+y_pt_1 <- neighbours_sf[ind_big[l], ]$geometry[[1]][1, 2]
+pt_1 <- st_sfc(st_point(c(x_pt_1, y_pt_1)), crs = crs_robin)
+# point 2
+x_pt_2 <- neighbours_sf[ind_big[l], ]$geometry[[1]][2, 1]
+y_pt_2 <- neighbours_sf[ind_big[l], ]$geometry[[1]][2, 2]
+pt_2 <- st_sfc(st_point(c(x_pt_2, y_pt_2)), crs = crs_robin)
+
+seg1 <- st_nearest_points(pt_1, long_sf_180[which.min(as.numeric(st_distance(pt_1, long_sf_180))), ])  
+seg2 <- st_nearest_points(pt_2, long_sf_180[which.min(as.numeric(st_distance(pt_2, long_sf_180))), ])  
+plot(st_geometry(seg1), add = T, col = "darkred")
+plot(st_geometry(seg2), add = T, col = "darkred")
+}
+```
+
+
+## Scatter plots  
+
+We plot the scatter plots showing how the components of the dependent variable (outward, return, transit) relate to each of the explanatory covariates.  This provides a first visual assessment of possible associations or patterns.  
+
+
+```{r, fig.width = 8, fig.height = 5}
+nom_vars <- c("hwf", "dry", "Lpop", "HDI", "politicalstability", 
+                   "percent_foreign", "percent_outside")
+
+names_title <- c(
+  "Heat wave frequency",
+  "Consecutive dry days",
+  "Log population",
+  "Human Development Index",
+  "Political stability",
+  "Percent foreign residents",
+  "Percent natives living abroad"
+)
+
+# Quantitative 
+for(l in 1:length(nom_vars)) {
+  
+  k <- nom_vars[l]
+  #pdf(paste0("figures/explo_", k, ".pdf"), width = 8, height = 5)
+  par(mfrow = c(2, 3), oma = c(0, 0, 0.2, 0), mar = c(3.3, 4, 1, 0.5), las = 1,
+    mgp = c(2.2, 1, 0))
+  
+  for(s in c("out", "in")) {
+    
+    plot(world_iso_3[[k]], world_iso_3[[paste0(s, "_outwards")]] / 
+       world_iso_3[[paste0(s, "_total")]],
+     xlab = names_title[l], ylab = paste0("Share of outwards among ", s, "flows"), 
+     pch = 16, col = pal_col_ternary[c(1)], ylim = c(0, 1))
+    abline(lm(world_iso_3[[paste0(s, "_outwards")]] / world_iso_3[[paste0(s, "_total")]] ~ 
+              world_iso_3[[k]]), col = "red")
+    if(s == "out")
+      title("Outward")
+    plot(world_iso_3[[k]], world_iso_3[[paste0(s, "_returns")]] / world_iso_3[[paste0(s, "_total")]],
+         xlab = names_title[l], ylab = paste0("Shares of returns among ", s, "flows"), 
+         pch = 16, col = pal_col_ternary[c(5)], ylim = c(0, 1))
+    abline(lm(world_iso_3[[paste0(s, "_returns")]] / world_iso_3[[paste0(s, "_total")]] ~ 
+              world_iso_3[[k]]), col = "red")
+    if(s == "out")
+      title("Return")
+    plot(world_iso_3[[k]], world_iso_3[[paste0(s, "_transit")]] / world_iso_3[[paste0(s, "_total")]],
+         xlab = names_title[l], ylab = paste0("Shares of transits among ", s, "flows"), 
+         pch = 16, col = pal_col_ternary[c(9)], ylim = c(0, 1))
+    abline(lm(world_iso_3[[paste0(s, "_transit")]] / world_iso_3[[paste0(s, "_total")]] ~ 
+              world_iso_3[[k]]), col = "red")
+    if(s == "out")
+      title("Transit")
+  }
+  #dev.off()
+}
+```
+
+```{r}
+noms_out <- c("out_outwards", "out_returns", "out_transit", 
+  "dry", "hwf", "politicalstability", 
+  "HDI", "Lpop", "percent_foreign", "percent_outside")    
+noms_in <- c("in_outwards", "in_returns", "in_transit", "dry", "hwf", 
+             "politicalstability", 
+  "HDI", "Lpop", "percent_foreign", "percent_outside") 
+
+cor(st_drop_geometry(world_iso_3)[, noms_out])
+cor(st_drop_geometry(world_iso_3)[, noms_in])
+```
+
+
+
+We use boxplots to represent how the compositions of the dependent variable (outward, return, transit) vary across categories of the qualitative covariates.  
+
+
+```{r, fig.width = 10, fig.height = 6}
+#pdf("figures/boxplot.pdf", width = 10, height = 6)
+my_conflict <- world_iso_3$class_conflict
+  par(mfrow = c(2, 3), oma = c(0, 0, 0, 0), mar = c(3, 4, 1, 1), las = 1)
+  for(s in c("out", "in")) {
+    # qualitative
+    boxplot(world_iso_3[[paste0(s, "_outwards")]] / world_iso_3[[paste0(s, "_total")]] ~ 
+              my_conflict, xlab = "conflict", ylab = paste0("Shares of ", s, "flows"), 
+            main = "Outward")
+    boxplot(world_iso_3[[paste0(s, "_returns")]] / world_iso_3[[paste0(s, "_total")]] ~ 
+              my_conflict, xlab = "conflict", ylab = paste0("Shares of ", s, "flows"),
+            main = "Return")
+    boxplot(world_iso_3[[paste0(s, "_transit")]] / world_iso_3[[paste0(s, "_total")]] ~ 
+              my_conflict, xlab = "conflict", ylab = paste0("Shares of ", s, "flows"), 
+            main = "Transit")
+  }
+ # dev.off()
+```
+
+# Modelling  
+
+## OLS  
+
+We first run a simple linear regression on each component of the ILR-transformed compositions.  
+This step serves as a baseline model, allowing us to assess the main effects of the covariates  
+before introducing spatial dependence structures.  
+
+```{r}
+ilr_base <- ilrBase(D = 3)
+v1 <- ilr_base[, 1]
+v2 <- ilr_base[, 2]
+ilr_base[1, 1] <- v2[3]
+ilr_base[2:3, 1] <- v2[1:2]
+ilr_base[1, 2] <- 0
+ilr_base[2:3, 2] <- v1[1:2]
+
+var_controls <-  c("Lpop", "HDI", "politicalstability", "class_conflict",
+                   "percent_foreign", "percent_outside") 
+vars_included <- c("hwf", "dry")
+var_climate <- paste0(c(""), rep(vars_included, each = 1))
+   
+temp_lm <- st_drop_geometry(world_iso_3)
+
+my_lm <- vector("list", 2)
+names(my_lm) <- c("out", "in")
+my_lm[["out"]] <- my_lm[["in"]] <- vector("list", 2)
+names(my_lm[["out"]]) <- names(my_lm[["in"]]) <- c("ilr_1", "ilr_2")
+
+for(type in c("out", "in")) {
+  temp_ilr <- ilr(temp_lm[, paste0(type, "_", c("outwards", "returns", "transit"))],
+                  V = ilr_base)
+  temp_lm[[paste0(type, "_ilr_1")]] <- temp_ilr[, 1]
+  temp_lm[[paste0(type, "_ilr_2")]] <- temp_ilr[, 2]
+
+  form_str <- paste(paste0(type, "_ilr_1 ~"), paste(c(var_climate, var_controls), 
+                                       collapse = " + "))
+  form_str_2 <- paste(paste0(type, "_ilr_2 ~"), paste(c(var_climate, var_controls), 
+                                       collapse = " + "))
+  
+  my_lm[[type]][["ilr_1"]] <- lm(as.formula(form_str), data = temp_lm) 
+  my_lm[[type]][["ilr_2"]] <- lm(as.formula(form_str_2), data = temp_lm) 
+  
+}
+```
+
+## Computing the predictions  
+
+We now compute the model predictions and visualize them.  This step reproduces Figures D.10 and D.11, which compare observed and predicted values for the different components of the migration flow compositions.  
+
+```{r, fig.width = 10, fig.height = 5}
+new_data <- lapply(temp_lm[, c(var_climate, var_controls)], 
+       function(x) ifelse(is.numeric(x), median(x), names(which.max(table(x))))) |>
+  as.data.frame()
+for(type in c("out", "in")) {
+  #pdf(paste0("figures/predicted_OLS_", type, "flows.pdf"), width = 10, height = 5)
+  par(mfrow = c(2, 4), oma = c(0, 0, 0, 0), mar = c(3.5, 4, 0.5, 0.5), las = 1,
+      mgp = c(2.2, 1, 0))
+  for(s in 1:length(nom_vars)){
+    k <- nom_vars[s] 
+    my_seq <- seq(min(temp_lm[[k]]), max(temp_lm[[k]]), length.out = 100)
+    res_pred <- matrix(0, 100, 2)
+    for(l in 1:100) {
+      new_data[[k]] <- my_seq[l]
+      predict_lm_1 <- predict(my_lm[[type]][["ilr_1"]], newdata = new_data)
+      predict_lm_2 <- predict(my_lm[[type]][["ilr_2"]], newdata = new_data)
+      res_pred[l, ] <- c(predict_lm_1, predict_lm_2)
+    }
+    res_pred_y <- ilrInv(res_pred, V = ilr_base)
+    pal_col <- RColorBrewer::brewer.pal(3, "Set2")
+    plot(my_seq, res_pred_y[, 1], type = "l", ylim = c(0, 1),
+         col = pal_col[1], ylab = paste0("Predicted shares in ", type, "flows"), 
+         xlab = names_title[s])
+    lines(my_seq, res_pred_y[, 2], col = pal_col[2])
+    lines(my_seq, res_pred_y[, 3], col = pal_col[3])
+    
+    if(s == 1)
+      legend("topleft", legend = c("Outward", "Return", "Transit"), lty = 1,
+             col = pal_col)
+  }
+  #dev.off()
+}
+```
+
+## Compute the semi-elasticities  
+
+We compute the semi-elasticities associated with the covariates, which quantify the relative change in each component of the migration composition resulting from a marginal variation of the explanatory variables.  
+
+```{r}
+res_impacts <-  data.frame(
+  var = character(0), 
+  model = character(0),
+  iso3 = character(0),
+  se1 = numeric(0), 
+  se2 = numeric(0),
+  se3 = numeric(0))
+add_unit <- c(hwf = 1, dry = 1, HDI = 0.00593, 
+              politicalstability = 0.0443764, 
+              percent_foreign = 0.01, percent_outside = 0.01)
+
+for(type in c("in", "out")) {
+  for(k in nom_vars) {
+    
+    # add unit
+    my_X_plus_only_ind_cnty <- st_drop_geometry(world_iso_3)
+    if(k != "Lpop") {
+      my_X_plus_only_ind_cnty[, k] <- my_X_plus_only_ind_cnty[, k] + add_unit[k]
+    } else {
+      # elasticities for Lpop
+     my_X_plus_only_ind_cnty[, "Lpop"] <- my_X_plus_only_ind_cnty[, "Lpop"] * 1.01
+    }
+    
+      predict_lm_1 <- predict(my_lm[[type]][["ilr_1"]], 
+                              newdata = st_drop_geometry(world_iso_3))
+      predict_lm_2 <- predict(my_lm[[type]][["ilr_2"]], 
+                              newdata = st_drop_geometry(world_iso_3))
+      Y_pred <- ilrInv(cbind(predict_lm_1, predict_lm_2), V = ilr_base)
+        
+    hat_y_ilr1 <- predict(my_lm[[type]][["ilr_1"]], 
+                          newdata = my_X_plus_only_ind_cnty)
+    hat_y_ilr2 <- predict(my_lm[[type]][["ilr_2"]], 
+                          newdata = my_X_plus_only_ind_cnty)
+    Y_plus <- ilrInv(cbind(hat_y_ilr1, hat_y_ilr2), V = ilr_base)
+    
+    temp_diff <- as(Y_plus, "matrix") - as(Y_pred, "matrix") 
+    names(temp_diff) <- paste0("se", 1:3)
+    res_impacts <- rbind(res_impacts,
+          data.frame(var = k,
+                     model = type,
+                     iso3 = world_iso_3$iso3,
+                     se1 = temp_diff[, 1],
+                     se2 = temp_diff[, 2],
+                     se3 = temp_diff[, 3]))
+  }
+}
+res_impacts %>%
+  filter(model == "out",
+         iso3 %in% c("BLZ", "SAU", "VNM"))
+
+res_impacts %>%
+  filter(model == "in",
+         iso3 %in% c("LBN", "CUB", "TCD"))
+```
+
+## Compute the Moran plot on the residuals  
+
+We assess the presence of spatial autocorrelation in the residuals by computing the Moran plot, as illustrated in Figure D.12 of the article. This diagnostic helps evaluate whether the linear model adequately accounts for spatial dependence.  
+
+```{r, fig.width = 10, fig.height = 7}
+W_listw <- nb2listw(nb_out)
+
+mat_out <- listw2mat(nb2listw(nb_out))
+pal_HH <- RColorBrewer::brewer.pal(4, "Set2")
+
+for(type in c("out", "in")) {
+ #pdf(paste0("figures/moran_residuals_", type, "flows.pdf"), width = 10, height = 7)  
+  par(mfrow = c(2, 2), oma = c(0, 0, 0, 0), las = 1,
+      mgp = c(2.2, 1, 0))  
+  for(r in c("ilr_1", "ilr_2")) {
+    # component 1 
+    
+    my_res <-  residuals(my_lm[[type]][[r]])
+    
+    #my_res <-  temp_lm$out_ilr_1
+    # hwf + dry + Lpop + HDI + politicalstability + class_conflict +
+    #new_lm <- lm(out_ilr_1 ~ percent_foreign, data = temp_lm) 
+    #my_res <-  residuals(new_lm)
+    #lm.morantest(new_lm, nb2listw(nb_out))
+    
+    my_res_lag <- lag.listw(nb2listw(nb_out), my_res)
+    HH <- my_res > 0 & my_res_lag > mean(my_res_lag)
+    HL <- my_res > 0 & my_res_lag <= mean(my_res_lag)
+    LH <- my_res <= 0 & my_res_lag > mean(my_res_lag)
+    LL <- my_res <= 0 & my_res_lag <= mean(my_res_lag)
+  
+    col_vec <- rep(pal_HH[2], 230)
+    col_vec[HL] <- pal_HH[1]
+    col_vec[LH] <- pal_HH[3]
+    col_vec[LL] <- pal_HH[4]
+  
+    # significant
+    local_ilr_1 <- localmoran(my_res, listw = W_listw)
+    col_vec <- ifelse(local_ilr_1[, 5] < 0.05, col_vec, scales::alpha(col_vec, 0.2))
+    
+    cat("p.value: ",  lm.morantest(my_lm[[type]][[r]], nb2listw(nb_out))$p.value, "\n")
+    par(mar = c(3.5, 4, 0.5, 0.5))
+    plot(my_res, my_res_lag, 
+       xlab = paste0("Residuals from the ", type, "flows OLS model (", r, ")"), 
+       ylab = "W x residuals", 
+       col = col_vec, pch = 16)
+    abline(h = mean(my_res_lag, na.rm = T), lty = 2, col = "lightgrey")
+    abline(v = 0, lty = 2, col = "lightgrey")
+    abline(coefficients(lm(my_res_lag ~ my_res)), col = "red", lty = 1)
+    text(my_res[local_ilr_1[, 5] < 0.05], my_res_lag[local_ilr_1[, 5] < 0.05],
+         world_iso_3[local_ilr_1[, 5] < 0.05, ]$"VISUALIZATION_NAME", pos = 2, 
+         cex = 0.6)
+           
+    par(mar = c(0, 0, 0, 0))
+    plot(st_geometry(world_iso_3), col = col_vec, border = "lightgrey")
+           
+  }
+  #dev.off()
+}
+```
+
+
+
+# Spatial CoDa Model  
+
+We now turn to the Spatial Autoregressive (SAR) model, adapted to compositional dependent variables (CoDa).  This specification explicitly accounts for spatial autocorrelation in migration flows and provides a more reliable framework than the simple linear model.  
+
+```{r, eval = T, echo = F}
+source("codes/estimate_spatial_multi_gen_N.R")
+```
+
+```{r}
+# results modeling
+res_sar_N <- vector("list", 2)
+names(res_sar_N) <- c("out", "in")
+
+# explanaotory variables
+Xe <- temp_lm[, c(var_climate, var_controls)]
+Xe$class_conflict_medium <- ifelse(Xe$class_conflict == "medium", 1, 0)
+Xe$class_conflict_high <- ifelse(Xe$class_conflict == "high", 1, 0)
+Xe$class_conflict_very_high <- ifelse(Xe$class_conflict == "very high", 1, 0)
+Xe$class_conflict <- NULL
+Xe <- data.frame(constant = 1, Xe)
+nom_vars <- names(Xe)
+Xe <- as(Xe, "matrix")
+
+# dependent variables
+Ye <- vector("list", 2)
+names(Ye) <- c("out", "in")
+
+for(type in c("out", "in")) {
+  Ye[[type]] <- as(ilr(temp_lm[, 
+                  paste0(type, "_", c("outwards", "returns", "transit"))],
+                  V = ilr_base), "matrix")
+  
+  res_sar_N[[type]] <- estimate_spatial_multi_gen_N(Y = Ye[[type]], 
+                  X = as(Xe, "matrix"), 
+                  W = OW, 
+                  method = "s2sls",
+                  ind_RHO = matrix(c(T, T, T, T), 2, 2), compute_sd = T)
+}
+```
+
+
+```{r, echo = F}
+source("codes/sp_semi_elast_Ycompo.R")
+```
+
+We use the function *sp_semi_elast_Ycompo()* to compute the semi-elasticities, focusing on the subset of selected countries. The results correspond to Figures 4.8 and 4.9 of the thesis.  
+
+```{r, fig.width = 10, fig.height=7.5}
+require(cartography)
+
+ind_cnty <- list(
+  "out" = c(ind_viet, ind_saudi, ind_belize),
+  "in" = c(ind_chad, ind_cuba, ind_lebanon) 
+)
+names_cnty <- list(
+  "out" = c("Viet Nam", "Saudi Arabia", "Belize"),
+  "in" = c("Chad", "Cuba", "Lebanon")
+)
+my_beta <-vector("list", 2)  
+my_RHO <-vector("list", 2) 
+names(my_beta) <- names(my_RHO) <- c("out", "in")
+
+for(type in c("out", "in")) {
+  my_beta[[type]] <- res_sar_N[[type]]$est_beta
+  my_RHO[[type]] <- res_sar_N[[type]]$est_RHO
+  
+  for(index_b in 2:3) {
+    elast_sp <- sp_semi_elast_Ycompo(Xe, my_beta[[type]], 
+              index_b = index_b, method = "exact",
+              W = OW, RHO = my_RHO[[type]], V_y = ilr_base)
+
+    # We represent the semi-elasticities in the three countries chosen in the article 
+    # fix the bounds of the colors
+    elas_k <- c(elast_sp[ind_cnty[[type]], , 1], 
+            elast_sp[ind_cnty[[type]], , 2], 
+            elast_sp[ind_cnty[[type]], , 3])
+  
+    pos_class <- classInt::classIntervals(elas_k[elas_k>0], 6, "kmeans")
+    neg_class <- classInt::classIntervals(elas_k[elas_k<0], 6, "kmeans")
+    
+    # we plot the se on the map 
+    rwb <- colorRampPalette(colors = c("blue", "white", "red"))
+
+  #pdf(paste0("figures/elasticites_spatial_", type, "flows_" , 
+  #           nom_vars[index_b], ".pdf"), 
+  #    width = 10, height = 7.5)
+  op <- par(mfrow = c(3, 3), oma = c(0, 1, 0, 0), mar = c(2, 2, 2, 2),
+          mgp = c(0, 0, 0))
+
+  for(l in 1:3) {
+    k <- ind_cnty[[type]][l]
+    world_iso_3$elas_1 <- elast_sp[k, , 1]
+    world_iso_3$elas_2 <- elast_sp[k, , 2]
+    world_iso_3$elas_3 <- elast_sp[k, , 3]
+    # we add one class for positive and negative
+    plot(st_geometry(st_buffer(world_iso_3[k, ], 1500000)), lty = 0,
+         ylab = paste0("Impacts due to a change \n of ", 
+                       nom_vars[index_b]," in ", 
+                       names_cnty[[type]][l]))
+    plot(sea, col = scales::alpha("lightblue", 0.1), 
+         border = rgb(0.15, 0.15, 0.15), add = T)
+    choroLayer(world_iso_3, var = "elas_1", 
+             breaks = c(neg_class$brks[1:6], pos_class$brks[2:7]),
+             col = rwb(11), legend.pos = "n", legend.values.rnd = 6, 
+             legend.title.txt = "se (outward)", border = rgb(0.5, 0.5, 0.5), 
+             lwd = 0.2, add = T)
+  if (l == 1) {
+    title("se Outward")
+  }
+
+    plot(st_geometry(st_buffer(world_iso_3[k, ], 1500000)), lty = 0)
+    plot(sea, col = scales::alpha("lightblue", 0.1), 
+         border = rgb(0.15, 0.15, 0.15), add = T)
+    choroLayer(world_iso_3, var = "elas_2", 
+             breaks = c(neg_class$brks[1:6], pos_class$brks[2:7]),
+             col = rwb(11), legend.pos = "n", legend.values.rnd = 6, 
+             legend.title.txt = "se (returns)", border = rgb(0.5, 0.5, 0.5), 
+             lwd = 0.2, add = T)
+  if (l == 1)
+    title("se Returns")
+    plot(st_geometry(st_buffer(world_iso_3[k, ], 1500000)), lty = 0)
+    plot(sea, col = scales::alpha("lightblue", 0.1), 
+         border = rgb(0.15, 0.15, 0.15), add = T)
+    choroLayer(world_iso_3, var = "elas_3", 
+             breaks = c(neg_class$brks[1:6], pos_class$brks[2:7]),
+             col = rwb(11), legend.pos = "right", 
+             legend.values.rnd = 6,  legend.title.txt = "semi-elasticities", 
+             border = rgb(0.5, 0.5, 0.5), lwd = 0.2, legend.values.cex = 0.8, 
+             add = T)
+  if (l == 1)
+    title("se Transit")
+  }
+  par(op)
+#dev.off()
+  }
+}
+```
+
+## Grouping the semi-elasticities  
+
+We use the function *map_elas_ternary()* to compute and visualize the grouped semi-elasticities.  
+Figure 4.10 shows the direct (DE, red) and indirect (IE, blue) semi-elasticities of migration compositions with respect to HWF.  The top panels display the results for outflows and the bottom panels for inflows, with ternary diagrams on the left and barplots of aggregated effects on the right.  
+
+
+```{r, echo = F}
+source("codes/map_elas_ternary.R")
+```
+
+
+```{r, warning = F}
+coords_s <- st_coordinates(st_centroid(world_iso_3))
+rownames(coords_s) <- world_iso_3$iso3
+```
+
+
+```{r, message = F, warning = F, fig.height = 7, fig.width= 6, warning = F, message = F}
+#pdf("figures/arrow.pdf", width = 7, height = 6)
+par(mfrow = c(2, 2), oma = c(0, 1, 0, 1), mar = c(0, 0.7, 0.1, 0.0))
+for(type in c("out", "in")) {
+  for(index_b in c(2, 3)) {
+    map_elas_ternary(coords_s, add = F, row_to_plot = ind_cnty[[type]][1],
+                  X = Xe, b_star = my_beta[[type]], index_b = index_b, W = OW,
+                 type = 1, scale_ternary = TRUE,
+                  RHO = my_RHO[[type]], delta = 50,
+                   ternary_unit = T, range = 1, 
+                 cex.pts = 0.2,  length = 0.05, 
+                 cex.legend = 0.6, lwd = 1.6,
+                 legend.ternary = c("Outward", "Return", "Transit"),
+                 names_ind = names_cnty[[type]][1], V_y = ilr_base)
+
+    map_elas_ternary(coords_s, add = T, row_to_plot = ind_cnty[[type]][2],
+                  X = Xe, b_star = my_beta[[type]], index_b = index_b, W = OW,
+                 type = 1, scale_ternary = FALSE,
+                  RHO = my_RHO[[type]], delta = 50,
+                   ternary_unit = T, range = 1, 
+                 cex.pts = 0.2,  length = 0.05, 
+                 cex.legend = 0.6, lwd = 1.6,
+                 legend.ternary = c("", "", ""),
+                 names_ind = names_cnty[[type]][2], V_y = ilr_base)
+
+    map_elas_ternary(coords_s, add = T, row_to_plot = ind_cnty[[type]][3],
+                  X = Xe, b_star = my_beta[[type]], index_b = index_b, W = OW,
+                 type = 1, scale_ternary = FALSE,
+                  RHO = my_RHO[[type]], delta = 50,
+                   ternary_unit = T, range = 1, 
+                 cex.pts = 0.2,  length = 0.05, 
+                 cex.legend = 0.6, lwd = 1.6,
+                 legend.ternary = c("", "", ""),
+                 names_ind = names_cnty[[type]][3], V_y = ilr_base)
+    
+    if(type == "out" & index_b == 2) {
+      mtext("Outflows model", side = 2)
+      title("HWF                ", 
+            line = -1, cex.main = 1, font.main = 2) 
+    }
+    if(type == "out" & index_b == 3) {
+      title("Dry                ", 
+            line = -1, cex.main = 1, font.main = 2)  
+    }
+    if(type == "in" & index_b == 2)
+      mtext("Inflows model", side = 2)
+  }
+}
+legend("topright", legend = c("direct", "indirect"), pch = c(NA, NA),
+       lwd = 3, col = c("#E16A86", "#009ADE"),
+       cex = 0.9, lty = NA, box.lwd = -1) #normal legend. Do not plot line
+par(font = 5) #change font to get arrows
+legend("topright", legend = c("        ", "          "), 
+       pch = c(174, 174),
+       lwd = 3, col = c("#E16A86", "#009ADE"),
+       cex = 0.9, lty = NA, bty = "n", box.lwd = -1) 
+#dev.off()
+```
+
+We summarize the results into direct, indirect and total effects:
+
+```{r}
+spatial_direct <- apply(elast_sp, 3, function(x) diag(x))
+spatial_total <- apply(elast_sp, c(1, 3), sum)
+spatial_indirect <- spatial_total - spatial_direct
+colnames(spatial_direct) <- colnames(spatial_total) <- 
+  colnames(spatial_indirect) <- c("Outward", "Return", "Transit")
+```
+
+
+We now plot the individual barplot 
+
+```{r, fig.width = 16, fig.height = 10, warning = F, message = F}
+source("codes/map_elas_bar.R")
+#pdf("figures/bar_local_cantons.pdf", 
+#    width = 16 * 0.5, height = 10 * 0.45)
+par(oma = c(0, 0, 0, 0), mar = c(0, 0, 0, 0),
+    mfrow = c(2, 2))
+for(type in c("out", "in")) {
+  for(index_b in c(2, 3)) {
+    elast_sp <- sp_semi_elast_Ycompo(Xe, my_beta[[type]], 
+                                 index_b = index_b, method = "appro",
+                                 delta = 0.001,
+                                 W = OW, RHO = my_RHO[[type]], V_y = ilr_base)
+
+    spatial_direct <- apply(elast_sp, 3, function(x) diag(x))
+    spatial_total <- apply(elast_sp, c(1, 3), sum)
+    spatial_indirect <- spatial_total - spatial_direct
+    colnames(spatial_direct) <- colnames(spatial_total) <- 
+      colnames(spatial_indirect) <- c("Outward", "Return", "Transit")
+
+plot(sea, col = scales::alpha("lightblue", 0.2), 
+         border = rgb(0.15, 0.15, 0.15))
+if(type == "out" & index_b == 2)
+  title("HWF", line = -1.1)
+if(type == "out" & index_b == 3)
+  title("Dry", line = -1.1)
+plot(world_iso_3[ind_cnty[[type]], ], add = T,
+     border = "red", lwd = 1, lty = 2, col = "yellow")
+map_elas_bar(spatial_direct, spatial_indirect, spatial_total, 
+             coords_s, add = T,
+             index_to_plot = ind_cnty[[type]], plot_scale = F,       
+             q4 = pal_col_ternary[c(1, 5, 9)],
+         width_bar = 1.3, max_bar = 5, cex.legend = 0.5, x.legend = "topleft",
+         label_s = F, round.scale = 0, 
+         print_legend = ifelse(type == "out" & index_b == 2, T, F))
+#text(coords_s[ind_cnty[[type]], 1] - 1500000, coords_s[ind_cnty[[type]], 2], 
+#     world_iso_3[ind_cnty[[type]], ]$VISUALIZATION_NAME,
+#     pos = 3, cex = 0.6, col = rgb(0.1, 0.1, 0.1))
+if(type == "out" & index_b == 2)
+  mtext(side = 2, text = "Outflows model", line = -1.1)
+  
+  if(type == "in" & index_b == 2)
+    mtext(side = 2, text = "Inflows model", line = -1.1)
+  }
+}
+#dev.off()
+```
+
+
+```{r, fig.width=13, fig.height = 5, warning = F, message = F}
+index_b <- 2 
+my_delta <- 50
+# merge spatial data 
+for(type in c("out", "in")) {
+
+#pdf(paste0("figures/hwf_semi_", type , ".pdf"), 
+#    width = 13 * 0.8, height = 4.35 * 0.8)
+par(oma = c(0, 0, 0, 0), mfrow = c(1, 2))
+
+# ternary 
+par(mar = c(0.2, 0, 0.2, 0))
+
+ map_elas_ternary(coords_s, add = F, row_to_plot = ind_cnty[[type]][1],
+                  X = Xe, b_star = my_beta[[type]], index_b = index_b, W = OW,
+                 type = 1, scale_ternary = TRUE,
+                  RHO = my_RHO[[type]], delta = my_delta,
+                   ternary_unit = T, range = 1, 
+                 cex.pts = 0.2,  length = 0.05, 
+                 cex.legend = 0.8, lwd = 1.6,
+                 legend.ternary = c("Outward", "Return", "Transit"),
+                 names_ind = names_cnty[[type]][1], V_y = ilr_base)
+
+    map_elas_ternary(coords_s, add = T, row_to_plot = ind_cnty[[type]][2],
+                  X = Xe, b_star = my_beta[[type]], index_b = index_b, W = OW,
+                 type = 1, scale_ternary = FALSE,
+                  RHO = my_RHO[[type]], delta = my_delta,
+                   ternary_unit = T, range = 1, 
+                 cex.pts = 0.2,  length = 0.05, 
+                 cex.legend = 0.6, lwd = 1.6,
+                 legend.ternary = c("", "", ""),
+                 names_ind = names_cnty[[type]][2], V_y = ilr_base)
+
+    map_elas_ternary(coords_s, add = T, row_to_plot = ind_cnty[[type]][3],
+                  X = Xe, b_star = my_beta[[type]], index_b = index_b, W = OW,
+                 type = 1, scale_ternary = FALSE,
+                  RHO = my_RHO[[type]], delta = my_delta,
+                   ternary_unit = T, range = 1, 
+                 cex.pts = 0.2,  length = 0.05, 
+                 cex.legend = 0.6, lwd = 1.6,
+                 legend.ternary = c("", "", ""),
+                 names_ind = names_cnty[[type]][3], V_y = ilr_base)
+    
+    if(type == "out")
+  mtext(side = 2, text = "Outflows model", line = -1.1)
+  
+  if(type == "in")
+    mtext(side = 2, text = "Inflows model", line = -1.1)
+  
+# Map    
+#####################################. 
+par(mar = c(0, 0, 0, 0))
+ elast_sp <- sp_semi_elast_Ycompo(Xe, my_beta[[type]], 
+                                 index_b = index_b, method = "appro",
+                                 delta = 0.001,
+                                 W = OW, RHO = my_RHO[[type]], V_y = ilr_base)
+
+    spatial_direct <- apply(elast_sp, 3, function(x) diag(x))
+    spatial_total <- apply(elast_sp, c(1, 3), sum)
+    spatial_indirect <- spatial_total - spatial_direct
+    colnames(spatial_direct) <- colnames(spatial_total) <- 
+      colnames(spatial_indirect) <- c("Outward", "Return", "Transit")
+
+plot(sea, col = scales::alpha("lightblue", 0.2), 
+         border = rgb(0.15, 0.15, 0.15))
+
+plot(world_iso_3[ind_cnty[[type]], ], add = T,
+     border = "red", lwd = 1, lty = 2, col = "yellow")
+map_elas_bar(spatial_direct, spatial_indirect, spatial_total, 
+             coords_s, add = T,
+             index_to_plot = ind_cnty[[type]], plot_scale = F,       
+             q4 = pal_col_ternary[c(1, 5, 9)],
+         width_bar = 1.3, max_bar = 5, cex.legend = 0.5, x.legend = "topleft",
+         label_s = F, round.scale = 0, 
+         print_legend = T)
+#dev.off()
+}
+```
+
+

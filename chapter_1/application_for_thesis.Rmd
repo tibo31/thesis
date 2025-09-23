@@ -1,0 +1,4043 @@
+---
+title: "R codes for the article: A novel approach based on optimal transport for estimating bilateral migration flows"
+author: "Thibault Laurent et al."
+date: "Last Update: `r format(Sys.Date(), '%d %B %Y')`"
+output :
+  rmdformats::html_clean:
+    toc: true
+    number_sections: yes
+    fig_caption: true
+    template: flatly
+    code_folding: hide
+  pdf_document:
+    number_sections: yes
+    toc: yes
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+**Abstract** This document contains the code used to reproduce the results of the article Estimating Bilateral Migration Flows: A Novel Optimal Transport-Based Approach. It also enables users to compute various bilateral migration flow estimates between country pairs from 1990 to 2024, including those presented by Abel and Cohen (2019). The analyses are based on the most recent United Nations population stock data (1990–2024), with specific adjustments applied at various stages of the estimation process. In addition to the core estimation routines, the document includes the code used to generate all figures and results presented in the article, as well as supplementary visualizations not featured in the published version. 
+
+
+**Prerequisites**
+
+Packages needed :
+```{r, message = FALSE}
+# Core data manipulation and visualization
+library(tidyverse)    # Collection of packages for data science (ggplot2, dplyr, etc.)
+library(scales)       # Functions to scale data for visualization (e.g., axis formatting)
+library(viridis)      # Colorblind-friendly palettes for ggplot2
+library(colorspace)   # Advanced color manipulation and palettes
+
+# Migration estimation and related utilities
+library(migest)       # Tools for working with migration flow data (Abel & Cohen)
+library(Barycenter)   # Optimal transport algorithms for flow estimation
+
+# Country names and visual representation
+library(countrycode)  # Convert between country codes and names (e.g., ISO3 to full name)
+library(ggflags)      # Add country flags to ggplot2 visualizations
+
+# Web and spatial data
+library(rvest)        # Web scraping: import tables and content from HTML pages
+library(sf)           # Simple Features for working with spatial/vector data in R
+```
+
+Notes on Package Installation
+```{r, eval = F, echo = T}
+# ---------------------------------------------------
+# 📦 Install ggflags package (for country flags)
+# Note: ggflags is hosted on an alternative CRAN-like repo
+install.packages(
+  "ggflags",
+  repos = c("https://jimjam-slam.r-universe.dev", "https://cloud.r-project.org")
+)
+
+# ---------------------------------------------------
+# 📦 Install Barycenter package (for optimal transport computations)
+# ⚠️ Barycenter requires Fortran, especially on Mac
+# If you're on macOS, follow these setup steps BEFORE installing:
+
+# 1. Open Terminal and run:
+# brew install gcc
+
+# 2. Configure Fortran paths for R:
+# mkdir -p ~/.R
+# nano ~/.R/Makevars
+
+# Then paste the following into the Makevars file:
+# FC = /opt/homebrew/bin/gfortran
+# F77 = /opt/homebrew/bin/gfortran
+# FLIBS = -L/opt/homebrew/opt/gcc/lib/gcc/current -lgfortran -lquadmath -lm
+
+# 3. (Optional but recommended)
+# export LDFLAGS="-L/opt/homebrew/opt/gcc/lib/gcc/current"
+# export CPPFLAGS="-I/opt/homebrew/opt/gcc/include"
+
+# 4. Now install the archived package in R:
+devtools::install_url('http://cran.r-project.org/src/contrib/Archive/Barycenter/Barycenter_1.3.tar.gz')
+```
+
+
+Functions used to make estimation:
+```{r}
+# function that uses Jefferson method to allocate migrants according to proportion 
+jefferson <- function(my_vect, n_seats) {
+  n <- length(my_vect)
+  quotient <- sum(my_vect) / n_seats
+  if(quotient != 0) {
+    # step 1
+    my_seats <- my_vect %/% quotient 
+    n_seats <- n_seats - sum(my_seats)
+    # step 2 
+    reste <- abs(my_vect %% quotient)
+    temp <- rev(order(reste))[1:n_seats]
+    my_seats[temp] <- my_seats[temp] + 1 
+  } else {
+    my_seats <- numeric(n)
+  } 
+  return(my_seats)
+}
+
+# function that computes drop and reverse negative methods
+my_diff <- function(m1, m2, type = "drop") {
+  stopifnot(type %in% c("drop", "reverse"))
+  diff <- m2 - m1
+  # drop
+  hat_drop <- diff
+  hat_drop[hat_drop < 0] <- 0
+  diag(hat_drop) <- 0
+  if(type == "drop") {
+    return(hat_drop)
+  } else { 
+    # reverse
+    hat_reverse <- t(diff)
+    hat_reverse[hat_reverse > 0] <- 0
+    hat_reverse <- hat_drop - hat_reverse
+    diag(hat_reverse) <- 0
+    return(hat_reverse)
+  }
+}
+
+# function that computes minimisation method (extract from ffs_demo())
+my_min <- function(m1, m2) {
+  n <- nrow(m1)
+  my_names <- rownames(m1)
+  # minimisation based on Open 
+  d0 <- expand.grid(a = 1:n, b = 1:n)
+  diag_count <- array(0, c(n, n, n))
+  diag_count <- with(data = d0, expr = replace(x = diag_count, 
+            list = cbind(a, a, b), values = apply(X = cbind(c(t(m1)), 
+                    c(t(m2))), MARGIN = 1, FUN = min)))
+
+  diag_zero <- diag_count + 1
+  diag_zero <- with(data = d0, expr = replace(x = diag_zero, 
+                                              list = cbind(a, a, b), values = 0))
+  x0 <- t(m1) - apply(X = diag_count, MARGIN = c(1, 3), 
+                           FUN = sum)
+  x1 <- t(m2) - apply(X = diag_count, MARGIN = c(1, 3), 
+                           FUN = sum)
+  x1 <- mipfp::Ipfp(seed = x1, target.list = list(2), target.data = list(colSums(x0)), 
+                    tol = 1, iter = 1e+05, tol.margins = 1)$x.hat
+  a0 <- mipfp::Ipfp(seed = diag_zero, target.list = list(c(1, 3), c(2, 3)), 
+                    target.data = list(x0, x1), tol = 1, iter = 1e+05, 
+                    tol.margins = 1)
+  f0 <- a0$x.hat + diag_count
+  res <- round(migest::sum_od(f0))[-(n+1), -(n+1)]
+  rownames(res) <- my_names
+  colnames(res) <- my_names
+  return(res)
+}
+
+# Optimal transport
+my_transport <- function(stock_0, stock_1, birth, residence, hat_outflows, 
+                         hat_inflows, rate_returns) {
+  
+  # initialization
+  my_names <- unique(birth)
+  n <- length(my_names)
+  
+  # results 
+  res <- matrix(0, n, n)
+  outwards <- numeric(n^2)
+  returns <- numeric(n^2)
+  transit <- numeric(n^2)
+  
+  # rule to compute stayers
+  Z1 <- stock_0 - hat_outflows
+  Z2 <- stock_1 - hat_inflows
+  Z <- ifelse(Z1 <= pmin(stock_0, stock_1), Z1, Z2) 
+
+  for(k in 1:n) {
+    # country k
+    ind_birth <- which(birth == my_names[k])
+    x0_k <- stock_0[ind_birth]
+    x1_k <- stock_1[ind_birth]
+    # stayers in foreign countries 
+    Z_k <- Z[ind_birth]
+    ind_res <- which(residence[ind_birth] == my_names[k])
+    tot_moov <- sum((x0_k - Z_k)[-ind_res])
+    # stayers in country k 
+    Z_k[ind_res] <- x1_k[ind_res] - tot_moov * rate_returns
+
+    # mass at t0 and t1
+    mass_0 <- x0_k - Z_k
+    mass_1 <- x1_k - Z_k
+    # correct potentiel negative values
+    mass_0[mass_0 < 0] <- 0
+    
+    # normalize 
+    t_mass_0 <- sum(mass_0) 
+    t_mass_1 <- sum(mass_1) 
+    
+    if(t_mass_0 != t_mass_1) {
+      if(t_mass_0 > t_mass_1)
+        mass_0 <- mass_0 * t_mass_1 / t_mass_0  
+      else 
+        mass_1 <- mass_1 * t_mass_0 / t_mass_1
+    }
+    my_cost <- matrix(ifelse(x0_k == 0, 1, 1/x0_k), n, n, byrow = T)
+    diag(my_cost) <- 10^9
+
+    # check 
+    for(i in 1:n) {
+      sum_ot <- sum(mass_1[-i])
+      if(mass_0[i] > sum_ot) {
+        mass_1[i] <- mass_1[i] - (mass_0[i] - sum_ot)
+        if(mass_1[i] < 0)
+          cat("negative value")
+    
+        mass_0[i] <- sum_ot
+      }
+    }
+    temp <- Barycenter::Sinkhorn(matrix(mass_0, ncol = 1), 
+                         matrix(mass_1, ncol = 1), 
+                     my_cost, lambda = 1, maxIter = 10000, 
+                     tolerance=10^(-3))$Transportplan
+
+
+    #
+    if(is.nan(temp[1, 1])) {
+      cat(k, "\n")
+      temp <- transport::transport(mass_0, mass_1,
+                                 costm = my_cost,
+                                 fullreturn = T,
+                                 method = "networkflow")$primal
+    }
+    # total
+    res <- res + temp
+    # outward
+    temp_1 <- temp
+    temp_1[!((1:n) == k), ] = 0
+    temp_1[k, k] = 0
+    outwards <- outwards + as.vector(temp_1)
+    # return
+    temp_1 <- temp
+    temp_1[, !((1:n) == k)] = 0
+    temp_1[k, k] = 0
+    returns <- returns + as.vector(temp_1)
+    # transit
+    temp_1 <- temp
+    temp_1[, k] = 0
+    temp_1[k, ] = 0
+    transit <- transit + as.vector(temp_1)
+  }
+  
+  rownames(res) <- my_names
+  colnames(res) <- my_names
+  
+  return(list(res = res,
+              outwards = outwards,
+              returns = returns,
+              transit = transit))
+}
+
+# Compute Independance
+bayes <- function(m1, m2) {
+  n <- nrow(m1)
+  my_names <- rownames(m1)
+  chi2 <- matrix(0, n, n)
+  for (k in 1:n) {
+    temp1 <- matrix(m1[k, ], n, n) 
+    temp2 <- matrix(m2[k, ], n, n, byrow = T)
+    chi2 <- chi2 + temp1 * temp2 / sum(m1[k, ]) 
+  }
+  rownames(chi2) <- my_names
+  colnames(chi2) <- my_names
+  return(round(chi2))
+}
+```
+
+# Import and manage the data 
+
+This section focuses on importing and cleaning the various datasets required for our analysis. We also include several visualization tools to facilitate a better understanding of the data.
+
+## Table of countries 
+
+To define the regions of interest, we rely on standardized country codes—either ISO3 or M49.
+While the United Nations primarily uses the M49 classification, ISO3 codes are widely used in other datasets and are often more convenient for merging or labeling purposes. To accommodate both formats, we maintain a reference table that includes:
+
+* The country name
+* Its corresponding ISO3 code
+* Its M49 code
+
+This ensures compatibility across various sources and facilitates data manipulation throughout the project.
+
+```{r, message = F, warning = F, eval = F}
+url <- "http://en.wikipedia.org/wiki/ISO_3166-1"
+
+tables_url_wiki <- url %>%
+  read_html() %>%
+  html_nodes("table") %>%
+  html_table(fill = T)
+
+country <- tables_url_wiki[[3]] %>%
+  dplyr::select(1, 3, 4) %>%
+  rename(name = 1, iso = 2, code = 3)
+save(country, file = "results/iso3.RData")
+```
+
+```{r, echo = F}
+load("results/iso3.RData")
+```
+
+
+## International Migrant Stock 2024
+
+We use the International Migrant Stock 2024 dataset, available from the United Nations Department of Economic and Social Affairs at https://www.un.org/development/desa/pd/content/international-migrant-stock.
+After importing the data, we standardize the variable names for consistency and clarity. We then merge the dataset with our reference table containing ISO3 and M49 country codes, along with standardized country names. This step ensures compatibility across datasets and allows for seamless integration in subsequent analyses.
+
+```{r, warning = F, message = F}
+# The years of interest:
+years <- c("1990", "1995", "2000", "2005", "2010", "2015", "2020", "2024")
+
+un <- readxl::read_xlsx("data/undesa_pd_2024_ims_stock_by_sex_destination_and_origin.xlsx",
+                        sheet = "Table 1", skip = 10) 
+un <- un %>% 
+  dplyr::select(c(2, 5, 6:31)) %>%
+  rename(dest = 1, dest_code = 2, birth = 3, birth_code = 4) %>%
+  filter(!(dest_code %in% c(663, 652, 535, 336))) 
+names(un)[5:31] <- c(paste0("tot_", years),
+                     paste0("m_", years),
+                     paste0("f_", years))
+```
+
+
+Note: Saint Barthélemy and the French part of Saint Martin are excluded from the analysis due to the absence of recorded foreign-born population data. For similar reasons, Vatican City and Bonaire, Sint Eustatius and Saba are also excluded.
+
+The International Migrant Stock (IMS) dataset provides, for each reference year and destination country, the number of international migrants disaggregated by country of birth.
+
+```{r}
+un_code <- un %>% 
+  filter(birth_code %in% unique(un$birth_code[un$birth_code < 900]))
+
+un_code <- merge(un, country[, c("iso", "code")], by.x = "dest_code", by.y = "code")
+un_code <- un_code %>%
+  dplyr::select(-dest_code) %>%
+  rename(dest_code = iso) %>%
+  filter(dest_code %in% country$iso)
+country <- country %>%
+  filter(iso %in% unique(un_code$dest_code)) 
+
+n <- nrow(country)
+```
+
+Finally, we have `r n` countries in our dataset. 
+
+**Note**: For all destination countries, some migrants may have an unknown country of origin (recorded as `"Others"` in the dataset). We retain this information, as it will be used later during demographic adjustments to ensure consistency and completeness of the migration flow estimates.
+
+```{r}
+un_others_count <- un %>%
+  filter(birth == "Others")
+```
+
+In previous versions of the database, several countries—namely Austria, China, Taiwan Province of China, France, Greece, Ireland, Libya, Saint Barthélemy, and Saint Martin—did not include an `"Others"` category. Furthermore, the `"Others"` category across all countries was generally underestimated compared to the 2024 version of the database. For this reason, we conducted a detailed statistical analysis focusing on migrants with unknown or unspecified origins to better understand and account for this discrepancy.
+
+```{r, eval = T, echo = T}
+temp_1 <- un_code %>%
+  filter(birth == "Others")
+temp_2 <- un_code %>%
+  filter(birth %in%  "World")
+```
+
+**Count of Unknown Migrants:** Among countries with more than 1,000,000 migrants whose country of birth is unknown, Germany stands out, peaking at nearly 4,000,000 in 2005. The United States follows with a peak of almost 5,000,000 in 2020, and the United Kingdom with nearly 3,000,000 in 2024. Notably, previous versions of the dataset reported substantially fewer unknown cases—for example, in 2005, Germany recorded only about 150,000 migrants with unknown origins, representing a difference of approximately 3,850,000 compared to the current data.
+
+```{r, eval = T, echo = T, fig.width = 10, fig.height = 5}
+par(las = 1)
+boxplot(temp_1[, 4:11], names = years, main = "Count")
+abline(h = 0.5, lty = 2)
+```
+
+This discrepancy can be explained by two main factors. First, compared to the previous dataset, the total recorded foreign population has increased. For example, in 2005, the total number of migrants in Germany rose from 9,400,000 to 11,200,000, an increase of 1,800,000. The second reason likely relates to changes in methodology. It appears that in the previous version, some migrants were assigned a country of birth that is now categorized as "Unknown." For instance, in Germany in 2005, there were around 5,600,000 migrants from Europe, whereas the updated dataset reports only 4,500,000. In other words, migration data is now available for fewer specific countries, with more cases being grouped under the "Unknown" category.
+
+
+**Shares of unknown:** Across all the data, the percentage of "Unknwon" equals `r round(sum(colSums(as(temp_1[, 4:11], "matrix"))) / sum(colSums(as(temp_2[,  4:11], "matrix"))) * 100, 2)`$%$ of the total number of migrants, which is quite significant.  We represent them across the years using a parallel boxplot:
+
+```{r, eval = T, echo = T, fig.width = 10, fig.height = 5}
+# The share of Other
+temp_3 <- temp_1[, 4:11] / temp_2[,  4:11] 
+par(las = 1)
+boxplot(temp_3, names = years, main = "Shares")
+abline(h = 0.5, lty = 2)
+```
+In particular, the number of 'Unknown' sometimes accounts for more than 50% of migrants in certain destination countries. These countries are:
+
+```{r}
+temp_2$dest[unique(which(temp_3 > 0.5, arr.ind = T)[, 1])]
+```
+
+
+We add the code of ISO 
+```{r}
+un_code <- merge(un_code, country[, c("iso", "code")], by.x = "birth_code", 
+                 by.y = "code")
+un_code <- un_code %>%
+  dplyr::select(-birth_code) %>%
+  rename(birth_code = iso)  %>%
+  filter(birth_code %in% country$iso) %>%
+  arrange(dest)
+```
+
+Finally, using the IMS database, we count the total number of migrants, including those from both known and unknown countries of birth. The data is then grouped by the observation period.
+
+```{r}
+un_foreign <- un %>%
+  filter(birth == "World")
+
+temp_names <- c("LocID", "tot_foreign_t0", "tot_foreign_t1", "m_foreign_t0", 
+                "m_foreign_t1", "f_foreign_t0", "f_foreign_t1")
+type_sexe <- c("tot_", "tot_", "m_", "m_", "f_", "f_")
+un_foreign_t1 <- un_foreign[, c("dest_code", paste0(type_sexe, c(1990, 1995)))]
+names(un_foreign_t1) <- temp_names
+un_foreign_t1$period <- "1990-1995"
+un_foreign_t2 <- un_foreign[, c("dest_code", paste0(type_sexe, c(1995, 2000)))]
+names(un_foreign_t2) <- temp_names
+un_foreign_t2$period <- "1995-2000"
+un_foreign_t3 <- un_foreign[, c("dest_code", paste0(type_sexe, c(2000, 2005)))]
+names(un_foreign_t3) <- temp_names
+un_foreign_t3$period <- "2000-2005"
+un_foreign_t4 <- un_foreign[, c("dest_code", paste0(type_sexe, c(2005, 2010)))]
+names(un_foreign_t4) <- temp_names
+un_foreign_t4$period <- "2005-2010"
+un_foreign_t5 <- un_foreign[, c("dest_code", paste0(type_sexe, c(2010, 2015)))]
+names(un_foreign_t5) <- temp_names
+un_foreign_t5$period <- "2010-2015"
+un_foreign_t6 <- un_foreign[, c("dest_code", paste0(type_sexe, c(2015, 2020)))]
+names(un_foreign_t6) <- temp_names
+un_foreign_t6$period <- "2015-2020"
+un_foreign_t7 <- un_foreign[, c("dest_code", paste0(type_sexe, c(2020, 2024)))]
+names(un_foreign_t7) <- temp_names
+un_foreign_t7$period <- "2020-2024"
+
+un_foreign <- rbind(un_foreign_t1, un_foreign_t2, un_foreign_t3, un_foreign_t4, 
+                    un_foreign_t5, un_foreign_t6, un_foreign_t7)
+```
+
+## WPP 2024
+
+We use the WPP 2024 dataset (available at https://population.un.org/wpp/Download/Standard/CSV/) to obtain data on population, deaths, and births.
+
+```{r, warning = F}
+wpp2024 <- readxl::read_xlsx("data/WPP2024_GEN_F01_DEMOGRAPHIC_INDICATORS_FULL.xlsx",
+                        sheet = "Estimates", skip = 16) 
+projection <-  readxl::read_xlsx("data/WPP2024_GEN_F01_DEMOGRAPHIC_INDICATORS_FULL.xlsx",
+                        sheet = "Medium variant", skip = 16) 
+wpp2024 <- rbind(wpp2024, projection)
+
+birth <- wpp2024 %>%
+  dplyr::select(3, 5, 11, 24, 30) %>%
+  rename(Location = 1, LocID = 2, Time = 3, Births = 4, Ratio = 5) %>%
+  mutate(Births = as.numeric(Births),
+         Ratio = as.numeric(Ratio),
+         RatioMale = Ratio / (Ratio + 100), 
+         RatioFemale = 100 / (Ratio + 100), 
+         BirthsMale = Births * RatioMale, 
+         BirthsFemale = Births * RatioFemale)
+
+death <- wpp2024 %>%
+  dplyr::select(3, 5, 11, 31, 32, 33) %>%
+  rename(Location = 1, LocID = 2, Time = 3, DeathTotal = 4, DeathMale = 5, DeathFemale = 6) %>%
+  mutate(DeathTotal = as.numeric(DeathTotal),
+         DeathMale = as.numeric(DeathMale),
+         DeathFemale = as.numeric(DeathFemale))
+  
+pop <- wpp2024 %>%
+  dplyr::select(3, 5, 11, 13, 14, 15) %>%
+  rename(Location = 1, LocID = 2, Time = 3, PopTotal = 4, PopMale = 5, PopFemale = 6) %>%
+  mutate(PopTotal = as.numeric(PopTotal),
+         PopMale = as.numeric(PopMale),
+         PopFemale = as.numeric(PopFemale))
+```
+
+We retain data for the years of interest. Births are aggregated into 5-year groups, while deaths are aggregated into 5-year groups and further categorized by sex. Moreover, birth and death data are provided from January 1st to December 31st. Since migrant stock data are available as of July 1st for the years 1990, 1995, 2000, 2005, 2010, 2015, 2020, and 2024, we divide the corresponding birth and death figures for these years by two.
+
+```{r, message = F}
+pop <- pop %>%
+  filter(Time %in% c(1990, 1995, 2000, 2005, 2010, 2015, 2020, 2024))
+
+# create groups of five years
+birth_period <- data.frame(period = character(),
+                           LoID = numeric(),
+                           Location = numeric(),
+                           tot_birth = numeric())
+death_period <- data.frame(period = character(),
+                           LoID = numeric(),
+                           Location = numeric(),
+                           tot_death = numeric(),
+                           m_death = numeric(),
+                           f_death = numeric())
+
+for(k in 1:(length(years) - 1)) {
+  begin_year <- as.numeric(years[k])
+  end_year <- as.numeric(years[k+1])
+  birth_period <- rbind(birth_period, birth %>% 
+    filter(Time %in% begin_year:end_year) %>%
+    mutate(Births = ifelse(Time %in% c(begin_year, end_year), Births / 2, Births),
+           BirthsMale = ifelse(Time %in% c(begin_year, end_year), 
+                               BirthsMale / 2, BirthsMale),
+           BirthsFemale = ifelse(Time %in% c(begin_year, end_year), 
+                                 BirthsFemale / 2, BirthsFemale),
+         period = paste0(begin_year, "-", end_year)) %>%
+    group_by(period, LocID, Location) %>% 
+    summarise(tot_birth = sum(Births), 
+              m_birth = sum(BirthsMale),
+              f_birth = sum(BirthsFemale)))
+  
+  death_period <- rbind(death_period, death %>% 
+    filter(Time %in% begin_year:end_year) %>%
+    mutate(DeathTotal = ifelse(Time %in% c(begin_year, end_year), DeathTotal / 2, DeathTotal),
+           DeathMale = ifelse(Time %in% c(begin_year, end_year), DeathMale / 2, DeathMale),
+           DeathFemale = ifelse(Time %in% c(begin_year, end_year), DeathFemale / 2, DeathFemale),
+         period = paste0(begin_year, "-", end_year)) %>%
+    group_by(period, LocID, Location) %>% 
+    summarise(tot_death = sum(DeathTotal),
+              m_death = sum(DeathMale),
+              f_death = sum(DeathFemale)
+              ))
+}
+
+demo <- merge(birth_period, death_period, by = c("period", "LocID", "Location"))
+demo <- demo %>%
+  filter(period != "Others")
+for(k in 1:nrow(demo)) {
+  t0 <- as.numeric(substr(demo$period[k], 1, 4))
+  t1 <- t0 + ifelse(t0 == 2020, 4, 5)
+  my_loc <- demo$LocID[k]
+  demo[k, "tot_pop_t0"] <- pop[pop$LocID == my_loc & pop$Time == t0, "PopTotal"]
+  demo[k, "tot_pop_t1"] <- pop[pop$LocID == my_loc & pop$Time == t1, "PopTotal"] 
+  demo[k, "m_pop_t0"] <- pop[pop$LocID == my_loc & pop$Time == t0, "PopMale"]
+  demo[k, "m_pop_t1"] <- pop[pop$LocID == my_loc & pop$Time == t1, "PopMale"]  
+  demo[k, "f_pop_t0"] <- pop[pop$LocID == my_loc & pop$Time == t0, "PopFemale"]
+  demo[k, "f_pop_t1"] <- pop[pop$LocID == my_loc & pop$Time == t1, "PopFemale"]  
+}
+demo$tot_birth <- round(demo$tot_birth * 10^3)
+demo$m_birth <- round(demo$m_birth* 10^3) # round(demo$tot_birth / 2)
+demo$f_birth <- round(demo$f_birth* 10^3) # round(demo$tot_birth / 2)
+demo$tot_death <- round(demo$tot_death * 10^3)
+demo$m_death <- round(demo$m_death * 10^3)
+demo$f_death <- round(demo$f_death * 10^3)
+demo$tot_pop_t0 <- round(demo$tot_pop_t0 * 10^3)
+demo$tot_pop_t1 <- round(demo$tot_pop_t1 * 10^3)
+demo$m_pop_t0 <- round(demo$m_pop_t0 * 10^3)
+demo$m_pop_t1 <- round(demo$m_pop_t1 * 10^3)
+demo$f_pop_t0 <- round(demo$f_pop_t0 * 10^3)
+demo$f_pop_t1 <- round(demo$f_pop_t1 * 10^3)
+```
+
+In the population data, the Channel Islands do not appear as a single entity because they are divided into Guernsey and Jersey. Therefore, we aggregate these two parts into one.
+
+```{r}
+Guernsey <- demo %>%
+  filter(Location == "Guernsey")
+Jersey <- demo %>%
+  filter(Location == "Jersey")
+channel <- Guernsey
+channel$LocID <- 830
+channel$Location <- "Channel Islands"
+channel[, 4:13] <- Guernsey[, 4:13] + Jersey[, 4:13]
+demo <- demo %>%
+  filter(LocID %in% country$code) %>%
+  rbind(channel)
+```
+
+We obtain a single table that, for each country and each 5-year period, provides information on births, deaths, and population at $t_0$ and $t_1$ categorized by sex.
+
+```{r}
+head(demo)
+```
+
+We now incorporate migration data:
+
+```{r}
+demo <- merge(demo, un_foreign, by = c("LocID", "period"))
+```
+
+By subtracting the number of migrants from the total population, we determine the number of natives in each country, which corresponds to the diagonal elements of the stock table. This calculation is performed for each sex and period.
+ 
+```{r}
+# we compute the number of native
+demo$tot_native_t0 <- demo$tot_pop_t0 - demo$tot_foreign_t0
+demo$tot_native_t1 <- demo$tot_pop_t1 - demo$tot_foreign_t1
+demo$m_native_t0 <- demo$m_pop_t0 - demo$m_foreign_t0
+demo$m_native_t1 <- demo$m_pop_t1 - demo$m_foreign_t1
+demo$f_native_t0 <- demo$f_pop_t0 - demo$f_foreign_t0
+demo$f_native_t1 <- demo$f_pop_t1 - demo$f_foreign_t1
+
+# we compute the Net : (pop(t1) - pop(t0)) - (birth - death)
+demo$tot_net <- (demo$tot_pop_t1 - demo$tot_pop_t0) - (demo$tot_birth - demo$tot_death)
+demo$m_net <- (demo$m_pop_t1 - demo$m_pop_t0) - (demo$m_birth - demo$m_death)
+demo$f_net <- (demo$f_pop_t1 - demo$f_pop_t0) - (demo$f_birth - demo$f_death)
+```
+
+
+# Some statistics on the orginal stock table
+
+Most of the results presented in this section were not included in the article; they were used primarily to gain a better understanding of the migrant stocks data. 
+
+## Available data 
+
+Let's run some statistics to identify which countries host the most different countries of birth.
+
+```{r, eval = T}
+count_pairs <- data.frame(country = country$name,
+                          as_dest = integer(length(country$iso)),
+                          as_origin = integer(length(country$iso)),
+                          resident = numeric(length(country$iso)),
+                          abroad = numeric(length(country$iso)))
+for(k in 1:length(country$iso)) {
+  count_pairs$as_dest[k] <- nrow(un_code[un_code$dest_code == country$iso[k], ])
+  count_pairs$as_origin[k] <- nrow(un_code[un_code$birth_code == country$iso[k], ])
+    count_pairs$resident[k] <- sum(un_code[un_code$dest_code == country$iso[k], "f_2024"])
+  count_pairs$abroad[k] <- sum(un_code[un_code$birth_code == country$iso[k], "f_2024"])
+}
+```
+
+For a given destination country, the average number of countries of birth is around `r round(mean(count_pairs$as_dest))`. We present the number of countries of birth for each destination country. It appears that Norway, Denmark, Greece, and Australia have a high diversity of birth countries. In contrast, Monaco and Saint-Helena have very few. 
+
+```{r, eval = T, echo = T, fig.width = 10, fig.height = 25}
+dotchart(count_pairs$as_dest[order(count_pairs$as_dest)], 
+         labels = count_pairs$country[order(count_pairs$as_dest)])
+```
+
+We now focus on the most represented countries of birth across destination countries worldwide. The most frequently represented countries are the United States and China, while the least represented are Mayotte or Saint-Pierre and Miquelon.
+
+```{r, eval = T, echo = T, fig.width = 10, fig.height = 25}
+dotchart(count_pairs$as_origin[order(count_pairs$as_origin)], 
+         labels = count_pairs$country[order(count_pairs$as_origin)])
+```
+
+## Cumulative stocks
+
+We now visualize the countries with the largest numbers of emigrants and immigrants. In 2024, India and China stand out as the top two countries with the highest numbers of migrants living abroad. Among the top 20 countries of origin, many are affected by ongoing conflicts (Ukraine, Russia, Palestine), recent conflicts (Syria, Afghanistan), or economic crises (Venezuela). The United States emerges as the leading destination for migrants, followed by Germany and Canada.
+
+```{r, eval = T, echo = T, message = F }
+count_pairs$iso2 <- countrycode(count_pairs$country, "country.name", "iso2c")
+count_pairs$continent <- countrycode(count_pairs$iso2, "iso2c", "continent")
+
+count_pairs_pivot <- count_pairs %>% 
+  mutate(iso2 = tolower(iso2),
+         total = resident + abroad) %>%
+  mutate(country = fct_reorder(substr(country, 1, 12), total)) %>%
+  arrange(-abroad) %>% 
+  pivot_longer(cols = 4:5, names_to = "Migrants", values_to = "Values")
+```
+
+```{r, eval = T, echo = T, fig.width = 12, fig.height = 8}
+p1 <- count_pairs %>% 
+  mutate(iso2 = tolower(iso2)) %>%
+  mutate(country = fct_reorder(substr(country, 1, 12), abroad)) %>%
+  arrange(-abroad) %>% 
+  head(n = 20) %>% 
+  ggplot(aes(abroad, country, fill = continent)) +
+  geom_col() +
+  geom_flag(x = 0, aes(country = iso2), size = 8) +
+  labs(y = "Country", x = "Emmigrants", 
+       title = "Top 20 origins of international migrants in 2024", 
+       caption = "Data source: United Nations 2024") +
+  scale_x_continuous(labels = comma) +
+  theme_minimal()
+
+p2 <- count_pairs %>% 
+  mutate(iso2 = tolower(iso2)) %>%
+  mutate(country = fct_reorder(substr(country, 1, 12), resident)) %>%
+  arrange(-resident) %>% 
+  head(n = 20) %>% 
+  ggplot(aes(resident, country, fill = continent)) +
+  geom_col() +
+  geom_flag(x = 0, aes(country = iso2), size = 10) +
+  labs(y = "Country", x = "Immigrants", 
+       title = "Top 20 destinations of international migrants in 2024", 
+       caption = "Data source: United Nations 2024") +
+  scale_x_continuous(labels = comma) +
+  theme_minimal()
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+We present the same graphics, but with data aggregated by geographic regions.
+
+```{r, eval = T, echo = T, fig.width = 12, fig.height = 8}
+count_pairs$region23 <- countrycode(count_pairs$iso2, "iso2c", "region23")
+temp_mig <- count_pairs %>% 
+  group_by(region23) %>%
+  summarise(abroad = sum(abroad),
+            resident = sum(resident))
+p1 <- temp_mig %>%
+  mutate(region23 = fct_reorder(substr(region23, 1, 12), abroad)) %>%
+  arrange(-abroad) %>% 
+  ggplot(aes(abroad, region23)) +
+  geom_col() +
+  labs(y = "Country", x = "Emmigrants", 
+       title = "Origins of migrants in 2024", 
+       caption = "Data source: United Nations 2024") +
+  scale_x_continuous(labels = comma) +
+  theme_minimal()
+
+p2 <- temp_mig %>%
+  mutate(region23 = fct_reorder(substr(region23, 1, 12), resident)) %>%
+  arrange(-resident) %>% 
+  ggplot(aes(resident, region23)) +
+  geom_col() +
+  labs(y = "Country", x = "Immigrants", 
+       title = "Destinations of migrants in 2024", 
+       caption = "Data source: United Nations 2024") +
+  scale_x_continuous(labels = comma) +
+  theme_minimal()
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+We now compare the origin of emigrants and destination of immigrants across continents for countries with the highest total migration stocks (emigrants + immigrants).
+
+* **Asia**: The net migration balance (emigrants - immigrants) is positive for the countries represented, meaning that more people are emigrating from these countries than immigrating to them.
+
+* **Europe**: The net migration balance is positive for countries affected by war (Russia, Ukraine) and for countries like Poland, Romania, and Portugal, which have more citizens living abroad than foreign migrants residing within their borders. In contrast, countries such as Germany, the United Kingdom, France, and Italy have a negative balance, as they attract more migrants than they send abroad.
+
+* **Americas**: The United States has the highest net migration difference, with a significant number of emigrants. However, for most other countries in the region, the opposite trend is observed, with more people leaving than arriving.
+
+* **Africa**: The migration pattern is similar to that of Asia, with all represented countries having more emigrants than immigrants. However, it is notable that many African countries still attract a considerable number of migrants.
+
+* **Oceania**: In contrast, Australia and New Zealand experience a negative migration balance, meaning they have more immigrants settling in their territories than emigrants leaving.
+
+```{r, eval = T, echo = T, fig.width = 15, fig.height = 8}
+my_continent <- c("Asia", "Europe", "Americas", "Africa", "Oceania")
+pop_range_breaks <- list(
+  c(-6000000, -4000000, -2000000, 0, 2000000, 4000000, 6000000),
+  c(-6000000, -4000000, -2000000, 0, 2000000, 4000000, 6000000),
+  c(-5000000,  0,  15000000, 30000000),
+  c(-2000000, -1000000, 0, 1000000, 2000000),
+  c(-500000, 0, 2500000, 5000000))
+res_p <- vector("list", 5)
+for(k in 1:5){
+  res_p[[k]] <- count_pairs_pivot %>% 
+    filter(continent == my_continent[k]) %>%
+    mutate(Values = ifelse(Migrants == "abroad", -Values, Values)) %>%
+    head(n = 20) %>% 
+  ggplot(aes(Values, country, fill = Migrants)) +
+  geom_col()  +
+  geom_flag(x = 0, aes(country = iso2), size = 4) +
+    scale_x_continuous(breaks  = pop_range_breaks[[k]],
+                       labels = scales::comma(abs(pop_range_breaks[[k]]))) + 
+  scale_fill_brewer(palette = "Dark2") +
+  theme_minimal() +
+  theme(legend.position = "top") 
+}
+
+gridExtra::grid.arrange(res_p[[1]], res_p[[2]], res_p[[3]], 
+                        res_p[[4]], res_p[[5]], ncol = 5)
+```
+
+
+For a given country of birth, we can also visualize the distribution of migrants across their countries of residence. It is notable that migrants from a particular country tend to settle in destinations within the same continent. For example:
+
+* Most Venezuelan migrants reside in Colombia, Peru, the United States, Brazil, and Ecuador. Spain also ranks among the top destinations, likely due to shared linguistic and cultural ties.
+
+* A significant number of migrants from India, Pakistan, and Bangladesh live in the Arabian Persian Gulf region, likely driven by economic opportunities.
+
+* Migrants from Syria, Afghanistan, and Myanmar primarily settle in neighboring countries: Turkey and Jordan for Syrians, Iran and Pakistan for Afghans, and Thailand and Bangladesh for Myanmar nationals.
+
+* Migrants from Morocco tend to follow a similar pattern to those from Romania, primarily settling in neighboring or nearby countries. Moroccan migrants predominantly reside in Spain and France, while Romanian migrants are mainly found in Germany and Italy.
+
+```{r, eval = T, echo = T, fig.width = 22, fig.height = 12}
+p <- vector("list", 20)
+my_col <- RColorBrewer::brewer.pal(5, "Set1")
+dest_name <- countrycode(count_pairs$country[order(-count_pairs$abroad)[1:20]],
+                         "country.name", "iso3c")
+
+code_colors <- c("Americas" = my_col[1], "Asia" = my_col[2], 
+                      "Europe" = my_col[3], "Oceania" = my_col[4], 
+                      "Africa" = my_col[5])
+for(k in 1:20)
+  p[[k]] <- un_code %>% 
+  filter(birth_code == dest_name[k]) %>% 
+  mutate(iso2 = tolower(countrycode(dest, "country.name", "iso2c")),
+         continent = factor(countrycode(iso2, "iso2c", "continent"))) %>%
+  mutate(country = fct_reorder(substr(dest, 1, 12), tot_2024)) %>%
+  arrange(-tot_2024) %>% 
+  head(n = 15) %>% 
+  ggplot(aes(tot_2024, country, fill = factor(continent))) +
+  geom_col() +
+  geom_flag(x = 0, aes(country = iso2), size = 5) +
+  labs(y = "Country", x = "Immigrants", 
+       title = paste0("Migrants from ", dest_name[k]), 
+       caption = "Data source: United Nations 2024") +
+  scale_x_continuous(labels = comma) +
+  scale_fill_manual(values = code_colors) +
+  theme_minimal()
+
+gridExtra::grid.arrange(p[[1]], p[[2]], p[[3]], p[[4]], p[[5]], p[[6]], 
+    p[[7]], p[[8]], p[[9]], p[[10]], p[[11]], p[[12]], p[[13]], p[[14]],
+    p[[15]], p[[16]], p[[17]], p[[18]], p[[19]], p[[20]], ncol = 5)
+```
+
+From the previous bar charts, it is evident that migrant distribution for a given country is not uniform across destination countries. To confirm this, we plot the Lorenz curve $(M_i/M_k,P_i/P_k)$, where for a given country $k$, $M_i$ represents the number of migrants from country $k$ residing in country $i$, and $P_i$ is the population of country $i$. Here, $M_k$ denotes the total number of migrants abroad from country $k$, while $P_k$ represents the total population of all destination countries hosting at least one migrant from country $k$. The observations are ordered according to the ratio $M_i/P_i$.
+
+Our dot chart confirms that, for a given country, a significant proportion of migrants reside in just a few destination countries.
+
+```{r, echo = F, eval = F, fig.width = 12, fig.height = 8}
+par(mfrow = c(4, 5), oma = c(0, 0, 0, 0), mar = c(3, 3, 0.5, 0.5))
+for(k in dest_name) {
+plot(c(0, 1), c(0, 1), type = "n", lty = 2,
+     xlab = "percent of closest neighbours", ylab = "shares of migrants")
+  title(k)
+
+temp_lorentz <- un_code %>%
+  filter(birth_code == k) %>%
+  merge(demo[demo$period == "2020-2024", ], by.x = "dest", by.y = "Location") %>%
+  mutate(ratio = tot_2024 / tot_pop_t1) %>%
+  arrange(ratio) %>%
+  mutate(gini_y = cumsum(tot_2024) / sum(tot_2024),
+         gini_x = cumsum(tot_pop_t1) / sum(tot_pop_t1))
+  
+if(nrow(temp_lorentz) > 1){
+# temp_lorentz$gini_x = (1:nrow(temp_lorentz))/nrow(temp_lorentz)
+  lines(c(0, temp_lorentz$gini_x), c(0, temp_lorentz$gini_y), 
+      type = "l", lty = 2, lwd = 2, col = "magenta")
+}
+abline(0, 1)
+}
+```
+
+## Statistics on the neighbours 
+
+We first calculate the shortest possible distance between the borders of the origin and destination countries. For instance, if a person migrates from Spain to France, the measured distance would be the shortest distance between the closest points on their borders. Since Spain and France share a common frontier, this distance would be zero.
+
+```{r}
+# using new geographic 
+source(file = "data/Load_Geospatial_Data.R")
+sf_use_s2(F)
+world_sf <- GeoDATA %>%
+  rename(region = SIREGION, iso3 = ISO3)
+countries_regions <- world_sf %>%
+  rmapshaper::ms_simplify(, keep = 0.05, keep_shapes = T)
+# polygons with same country than UN data basis
+my_proj <- '+proj=robin +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs'
+world <- st_transform(countries_regions, my_proj)
+world_union <- st_union(world)
+
+# contours, longitude and latitude of the map
+p1 <- rbind(c(-180, -90), 
+            c(180, -90),
+            cbind(180, seq(-90, 90, by = 1)),
+            c(180, 90),
+            c(-180, 90),
+            cbind(-180, seq(90, -90, by = -1)),
+            c(-180, -90))
+border_sf <- st_sfc(st_polygon(list(p1)))
+long_sf <- st_sfc(st_linestring(cbind(-150, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(-120, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(-90, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(-60, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(-30, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(0, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(150, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(120, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(90, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(60, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(30, seq(-90, 90, by = 1)))
+)
+lat_sf <- st_sfc(st_linestring(cbind(seq(-180, 180, by = 1), -60)),
+                  st_linestring(cbind(seq(-180, 180, by = 1), -30)),
+                  st_linestring(cbind(seq(-180, 180, by = 1), -0)),
+                  st_linestring(cbind(seq(-180, 180, by = 1), 30)),
+                  st_linestring(cbind(seq(-180, 180, by = 1), 60))
+)
+# Coordinate Reference System
+st_crs(border_sf) <- 4326
+st_crs(long_sf) <- 4326
+st_crs(lat_sf) <- 4326
+border_sf <- st_transform(border_sf, my_proj)
+long_sf <- st_transform(long_sf, my_proj)
+lat_sf <- st_transform(lat_sf, my_proj)
+sea <- st_difference(border_sf, world_union)
+```
+
+```{r, echo=F, eval=F}
+# We compute the shortest distance between two polygons
+my_dist <- data.frame(
+  from = rep(world_sf$iso3, each = nrow(world_sf)),
+  to =  rep(world_sf$iso3, times = nrow(world_sf)),
+  my_dist = as.vector(st_distance(countries_regions)))
+save(my_dist, file = "results/my_dist.RData")
+```
+
+
+```{r, echo = F}
+load("results/my_dist.RData")
+```
+
+
+```{r}
+# merge with Un data 
+un_code <- merge(un_code, my_dist, by.x = c("dest_code", "birth_code"), 
+                 by.y = c("from", "to"))
+```
+
+The chart below illustrates these distances for all international migrant populations worldwide, while also highlighting the total number of people living outside their home country in 2024.
+
+Example of interpretation:
+
+* $36\%$ of migrants worldwide reside in a neighboring country, meaning a country with which their country of origin shares a common border.
+
+* $50\%$ of migrants live in a country located less than 750 km from their country of origin.
+
+```{r, fig.width = 8, fig.height = 6}
+temp <- un_code
+temp <- temp[order(temp$my_dist), ]
+temp <- aggregate(temp[, "tot_2024"], by = list(my_dist = temp$my_dist), 
+                  FUN = sum)
+temp$x <- cumsum(temp$x)/sum(temp$x)
+par(las = 1)
+plot(temp$my_dist / 1000, temp$x, type = "l",
+     xlab = "distance from country birth (km)", 
+     ylab = "share of migrants", ylim = c(0, 1))
+abline(v = 0, lty = 2, col = "grey")
+```
+
+
+For each country, we map the preferred destinations where at least $80%$ of its emigrants reside. This visualization confirms that migrants from a given country generally settle in nearby or regional destinations. However, the United States stands out as a notable exception, consistently appearing as a key destination for migrants from diverse origins worldwide.
+
+```{r, eval = T, echo = T, fig.width = 28, fig.height = 12}
+countries_regions <- st_transform(countries_regions, my_proj)
+p <- vector("list", 20)
+my_col <- RColorBrewer::brewer.pal(5, "Set1")
+dest_name <- countrycode(count_pairs$country[order(-count_pairs$abroad)[1:20]],
+                         "country.name", "iso3c")
+
+code_colors <- c("AMERICAS" = my_col[1], "ASIA" = my_col[2], 
+                      "EUROPE" = my_col[3], "OCEANIA" = my_col[4], 
+                      "AFRICA" = my_col[5])
+pdf("test.pdf", width = 20, height = 8.5)
+par(mfrow = c(4, 5), oma = c(0, 0, 0, 0), mar = c(0, 0, 0.5, 0))
+for(k in 1:20) {
+  temp_pays <- un_code %>% 
+  filter(birth_code == dest_name[k]) %>% 
+  mutate(iso2 = tolower(countrycode(dest, "country.name", "iso2c")),
+         continent = factor(countrycode(iso2, "iso2c", "continent"))) %>%
+  mutate(country = fct_reorder(substr(dest, 1, 12), tot_2024)) %>%
+      arrange(tot_2024) %>%
+    mutate(pct_rate = 1 - cumsum(tot_2024 / sum(tot_2024))) %>% 
+    filter(pct_rate < 0.80)
+  
+  plot(sea, col = "lightblue", border = rgb(0.2, 0.2, 0.2))
+  title(dest_name[k], line = -0.5)
+  plot(st_geometry(world_union), add = T, border = rgb(0.2, 0.2, 0.2))
+  plot(st_geometry(countries_regions[countries_regions$iso3 == dest_name[k],]),
+                 col = "yellow", border = code_colors[countries_regions[which(countries_regions$iso3 == 
+                       dest_name[k]),][["CONTINENT"]]], lwd = 1.3, add = T)
+  plot(st_geometry(countries_regions[countries_regions$ISO2 %in% 
+                                       toupper(temp_pays$iso2),]), 
+       col = code_colors[countries_regions[countries_regions$ISO2 %in% 
+                       toupper(temp_pays$iso2),][["CONTINENT"]]], add = T)
+plot(long_sf, add = T, col = "lightgrey")
+plot(lat_sf, add = T, col = "lightgrey")
+}
+dev.off()
+```
+
+
+# Demographic Adjustements 
+
+Before the estimation process, we compute the matrices $S(t_k)$ for the different years $t_k = 1990, 1995, 2000, 2005, 2010, 2015, 2020, 2024$. We define three versions of the stock tables as presented in Subsection 2.3. of the article:
+
+* Raw data (directly from the IMS): The stock tables remain unchanged. For each period $T = [t_0, t_1]$, the IMS data are converted into two square matrices, $S(t_0)$ and $S(t_1)$, representing the stock tables at times $t_0$ and $t_1$.
+
+* Open demographic adjustment following Abel (2013): The row $k$ of the stock tables $S(t_0)$ and $S(t_1)$ is adjusted so that the row margins of both tables are equal and correspond to the minimum of the row margins of $S(t_0)$ and $S(t_1)$.
+
+* Closed demographic adjustment following Abel and Sander (2014): The row $k$ of the stock tables $S(t_0)$ and $S(t_1)$ is adjusted so that the row margins of both tables are equal and correspond to the mid-range of the row margins of $S(t_0)$ and $S(t_1)$, with the constraint that the total resident population remains unchanged.
+
+We make several assumptions:
+
+* If no information is available on migration between a country of birth $i$ and a country of residence $j$, we assume that there are no migrants from $i$ in $j$. This assumption impacts `r round(100 * (1 - nrow(un_code) / 230^2), 1)`$%$ of all possible country pairs, given the $230 \times 230$ combinations. Additionally, some country pairs explicitly report zero values. The proportion of zeros in our stock tables varies between `(r round(0.56 + 100 * (1 - nrow(un_code) / 230^2), 1)`, `r round(2.5 + 100 * (1 - nrow(un_code) / 230^2), 1)`)$%$, depending on the year.
+
+* Opened and closed demographic adjustments are performed in three stages:
+    + Stage 1 "Stayers $S_i^i$": The diagonal elements, which represent the number of individuals born in country $i$ and residing in $i$ at time $t$, are set equal to the total population at $t$ minus the number of migrants living in $i$ at $t$. This adjustment is achieved by integrating data from the WPP 2024 and IMS databases.
+    + Stage 2 "Birth and Death Adjustment": The number of deaths in each country over period $T$ is allocated proportionally across all countries of birth, including migrants whose country of birth is classified as "Unknown."
+    + Stage 3 "Row-Margin Adjustments (see above)": This step ensures consistency in stock tables by applying methods primarily implemented in the **migest** package.
+
+```{r, eval = F}
+ptm <- proc.time()
+for (k in 1:(length(years) - 1)) {
+   my_period <- paste0(years[k], "-", years[k + 1])
+   cat("Period: ", my_period, "\n")
+   for (l in c("tot", "m", "f")) {
+     cat("  Sex: ", l, "\n")
+     # create the stock tables as matrices
+     s1 <- pivot_wider(data = un_code[, c("dest_code", "birth_code", 
+              paste0(l, "_", years[k]))], names_from = 1, values_from = 3)
+     s2 <- pivot_wider(data = un_code[, c("dest_code", "birth_code", 
+            paste0(l, "_", years[k + 1]))], names_from = 1, values_from = 3)
+     
+     # permute and give row and col names for s1
+     birth_code <- s1$birth_code
+     temp_re <- s1$birth_code[!s1$birth_code %in% colnames(s1)]
+     if(length(temp_re) >= 1) {
+       s1[, temp_re] <- 0
+     }
+     s1 <- as(s1[, country$iso], "matrix")
+     row.names(s1) <- birth_code
+     s1 <- s1[country$iso, ]
+     
+     # permute and give row and col names for s2
+     birth_code <- s2$birth_code
+     temp_re <- s2$birth_code[!s2$birth_code %in% colnames(s2)]
+     if(length(temp_re) >= 1) {
+       s2[, temp_re] <- 0
+     }
+     s2 <- as(s2[, country$iso], "matrix")
+     row.names(s2) <- birth_code
+     s2 <- s2[country$iso, ]
+     
+     # H1 - Replace NA by 0
+     s1[is.na(s1)] <- 0
+     s2[is.na(s2)] <- 0
+     
+     # H2 - we add the diagonal elements
+     demo_k <- demo %>% filter(years[k] == as.integer(substr(demo$period, 1, 4)))
+     # birth and death vector
+     my_birth <- demo_k[match(country$code, demo_k$LocID), paste0(l, "_birth")]
+     names(my_birth) <- country$iso
+     my_death <- demo_k[match(country$code, demo_k$LocID), paste0(l, "_death")]
+     names(my_death) <- country$iso
+     # native population
+     diag(s1) <- demo_k[match(country$code, demo_k$LocID), paste0(l, "_native_t0")]
+     diag(s2) <- demo_k[match(country$code, demo_k$LocID), paste0(l, "_native_t1")]
+     # replace 0 and -1 at s0 by 1
+     diag(s1)[diag(s1) <= 1] <- 1
+     # replace 0 and -1 by the number of birth
+     diag(s2)[diag(s2) <= 1] <- my_birth[diag(s2) <= 1]
+          
+     #########
+     # Demographic Adjustment : birth and death adjustments 
+     # We add the row Others to s1
+     my_other <- un_others_count[match(country$code, un_others_count$dest_code), 
+                                 paste0(l, "_", years[k])] %>% pull()
+     my_other[is.na(my_other)] <- 0
+     
+     ############## for Open method ###########################################
+     
+     # a. birth/death adjustement
+     s2_open <- s2 - diag(my_birth)
+     # we take into account the Others (H3 - Death Adjustment)
+     s1_open <- rbind(s1, my_other)
+     for (i in 1:ncol(s1)) {
+       s1_open[, i] <- s1_open[, i] - jefferson(s1_open[, i], my_death[i])    
+     }
+     # we drop the last row corresponding to Others 
+     s1_open <- s1_open[-nrow(s1_open), ]
+   
+     # b. row-margins adjustment 
+     sum_1 <- rowSums(s1_open)
+     sum_2 <- rowSums(s2_open)
+     diff <- abs(sum_2 - sum_1)
+     for (i in 1:nrow(s1_open)) {
+       if (sum_1[i] < sum_2[i]) {
+         s2_open[i, ] <- s2_open[i, ] - jefferson(s2_open[i, ], diff[i])
+         } else {
+           s1_open[i, ] <- s1_open[i, ] - jefferson(s1_open[i, ], diff[i])    
+         }
+     }
+
+
+     ############## for Close method ###########################################
+     
+     # a. Normally, the difference of total population between S1 and S0 should
+     # be explained by the natural increase. If it is not the case, we report this difference
+     # compute the number of deaths whic are different from "others"
+     my_death_2 <- my_death * colSums(s1) / colSums(rbind(s1, my_other)) 
+     # on the stayers 
+     pop_grow <- sum(s2 - s1)
+     nat_grow <- sum(my_birth - my_death_2)
+     dd <- nat_grow - pop_grow
+     tot1 <- sum(diag(s1))
+     tot2 <- sum(diag(s2))
+     s1_closed <- s1
+     s2_closed <- s2
+     if (round(dd%%2) == 0 & dd%%2 != 0) {
+       diag(s2_closed) <- rescale_integer_sum(x = diag(s2_closed), 
+                                             tot = tot2 + 1)
+       pop_grow <- sum(s2_closed - s1_closed)
+       dd <- nat_grow - pop_grow
+       tot2 <- sum(diag(s2_closed))
+     }
+     if (dd != 0) {
+       diag(s1_closed) <- migest::rescale_integer_sum(x = diag(s1_closed), 
+                                                     tot = tot1 - dd/2)
+       diag(s2_closed) <- migest::rescale_integer_sum(x = diag(s2_closed), 
+                                                     tot = tot2 + dd/2)
+     }
+     
+     # b. birth/death adjustment
+     #d_mat <- migest:::death_mat(d_por = my_death, m1 = s1_closed, method = death_method, 
+     #                  m2 = s2_closed, b_por = my_birth)
+     #s1_closed <- s1_closed - d_mat
+
+     # Check non negative values  (code from function birth_mat())
+     xx <- diag(s2_closed) - my_birth < 0
+     if (sum(xx) > 0) {
+       temp <- mipfp::Ipfp(seed = s2_closed, target.list = list(2), 
+                           target.data = list(my_birth/2), 
+                           tol = 1, iter = 1e+05,
+                           tol.margins = 1)$x.hat[, xx]
+     }
+     
+     s2_closed <- s2_closed - diag(my_birth)
+     if (sum(xx) > 0) {
+       s2_closed[, xx] <- temp
+     }
+     
+     # death adjustment by taking into account the Others (H3 - Death Adjustment)
+     # s1_closed <- rbind(s1_closed, my_other)
+     for (i in 1:ncol(s1)) { 
+        # s1_closed[, i] <- s1_closed[, i] - jefferson(s1_closed[, i], my_death_2[i])  
+        s1_closed[, i] <- s1_closed[, i] -  
+          my_death_2[i] * s1_closed[, i] / sum(s1_closed[, i])  
+      }
+     # we drop the last row corresponding to Others 
+    # s1_closed <- s1_closed[-nrow(s1_closed), ]
+      
+     #########
+
+     # c. To get the same number of observations in s1 and s2
+     # we adjust with the stayers
+     #dd <- sum(s2_closed) - sum(s1_closed)
+     #if (dd != 0) {
+     #   diag(s1_closed) <- diag(s1_closed) + jefferson(diag(s1_closed), ceiling(dd * 0.5))
+     #  diag(s2_closed) <- diag(s2_closed) - jefferson(diag(s2_closed), floor(dd * 0.5))  
+     #}
+    
+       
+     # we adjust the row sums 
+     dd <- rowSums(s1_closed) - rowSums(s2_closed)
+     s1_closed <- mipfp::Ipfp(seed = s1_closed, target.list = list(1, 2), 
+                     target.data = list(rowSums(s1_closed) - dd/2, colSums(s1_closed)), 
+                     tol = 0.00001, iter = 1e+05, tol.margins = 0.00001)
+     s2_closed <- mipfp::Ipfp(seed = s2_closed, target.list = list(1, 2), 
+                     target.data = list(rowSums(s2_closed) + dd/2, colSums(s2_closed)), 
+                     tol = 0.00001, iter = 1e+05, tol.margins = 0.00001)
+  
+     s1_closed <- s1_closed$x.hat
+     s2_closed <- s2_closed$x.hat
+  
+     ################
+       save(s1, s2, s1_open, s2_open, s1_closed, s2_closed, 
+          file = paste0("results/stock_", l, "_", years[k], ".RData"))
+   }
+}
+```
+
+
+# Preparation of the Optimal Transport Method 
+
+In the first part of the Optimal Transpoot methodology (section 4 in the article),  we leverage auxiliary information to deepen our understanding of migration dynamics by focusing on two key goals:
+
+* Estimating Migration Flows: We aim to estimate the outflows and inflows for each country-of-birth and country-of-residence pair. 
+* Estimating Return Migration: We also seek to estimate the proportion of returnees among the outflows—migrants who leave a country of residence to return to their country of birth. 
+
+
+## Eurostat
+
+This dataset is used to estimate outflows and inflows relative to stock data (See subsection 4.2 in the article). The source is available [here](https://ec.europa.eu/eurostat/cache/metadata/en/migr_immi_esms.htm). 
+
+```{r, warning = F, message = F}
+# outflows 
+test <- read.table("data/estat_migr_emi4ctb.tsv", sep = '\t', header = TRUE)
+test <- test %>%
+    mutate_at(vars(`X2023`:`X2008`), str_extract, pattern = "[0-9]+") %>%
+    mutate_at(vars(`X2023`:`X2008`), as.numeric)
+test <- test %>%
+    separate(`freq.age.agedef.c_birth.unit.sex.geo.TIME_PERIOD`,
+             c("freq", "age", "agedef", "c_birth", "unit", "sex", "geo", "TIME_PERIOD"),
+             sep = ",") %>%
+  filter(agedef == "COMPLET", age == "TOTAL", sex == "T") %>%
+  dplyr::select(4, 7, 9:24) %>%
+  rename(birth = 1, REF_AREA = 2) %>%
+  pivot_longer(cols = 3:18, names_to = "TIME_PERIOD", values_to = "outflows") 
+test$TIME_PERIOD <-  as.numeric(substr(test$TIME_PERIOD, 2, 5))
+test <- test[!is.na(test$outflows), ]
+# convert iso2 to iso3
+test$birth <- countrycode(test$birth, "iso2c", "iso3c")
+test$REF_AREA <- countrycode(test$REF_AREA, "iso2c", "iso3c")
+test <- test[!is.na(test$birth), ]
+test <- test[!is.na(test$REF_AREA), ]
+y_eurostat <- test[test$birth != test$REF_AREA, ]
+
+# inflows 
+test <- read.table("data/estat_migr_imm3ctb.tsv", sep = '\t', header = TRUE)
+test <- test %>%
+    mutate_at(vars(`X2023`:`X2008`), str_extract, pattern = "[0-9]+") %>%
+    mutate_at(vars(`X2023`:`X2008`), as.numeric)
+test <- test %>%
+    separate(`freq.age.agedef.c_birth.unit.sex.geo.TIME_PERIOD`,
+             c("freq", "age", "agedef", "c_birth", "unit", "sex", "geo", "TIME_PERIOD"),
+             sep = ",") %>%
+  filter(agedef == "COMPLET", age == "TOTAL", sex == "T") %>%
+  dplyr::select(4, 7, 9:24) %>%
+  rename(birth = 1, REF_AREA = 2) %>%
+  pivot_longer(cols = 3:18, names_to = "TIME_PERIOD", values_to = "inflows") 
+test$TIME_PERIOD <-  as.numeric(substr(test$TIME_PERIOD, 2, 5))
+test <- test[!is.na(test$inflows), ]
+# convert iso2 to iso3
+test$birth <- countrycode(test$birth, "iso2c", "iso3c")
+test$REF_AREA <- countrycode(test$REF_AREA, "iso2c", "iso3c")
+test <- test[!is.na(test$birth), ]
+test <- test[!is.na(test$REF_AREA), ]
+test <- test[test$birth != test$REF_AREA, ]
+y_eurostat <- merge(y_eurostat, test, 
+                    by = c("birth", "REF_AREA", "TIME_PERIOD"),
+                    all = T) 
+
+# keep only the pairs of country available 
+codes_iso3 <- c("AFG", "ALB", "DZA", "ASM", "AND", "AGO", "AIA", "ATG", "ARG", 
+   "ARM", "ABW", "AUS", "AUT", "AZE", "BHS", "BHR", "BGD", "BRB", "BLR", "BEL", 
+   "BLZ", "BEN", "BMU", "BTN", "BOL", "BIH", "BWA", "BRA", "BRN", "BGR", "BFA", 
+   "BDI", "CPV", "KHM", "CMR", "CAN", "CYM", "CAF", "TCD", "CHL", "CHN", "COL", 
+   "COM", "COG", "COD", "COK", "CRI", "CIV", "HRV", "CUB", "CUW", "CYP", "CZE", 
+   "DNK", "DJI", "DMA", "DOM", "ECU", "EGY", "SLV", "GNQ", "ERI", "EST", "SWZ", 
+   "ETH", "FLK", "FRO", "FJI", "FIN", "FRA", "GUF", "PYF", "GAB", "GMB", "GEO", 
+   "DEU", "GHA", "GIB", "GRC", "GRL", "GRD", "GLP", "GUM", "GTM", "GIN", "GNB", 
+   "GUY", "HTI", "HND", "HKG", "HUN", "ISL", "IND", "IDN", "IRN", "IRQ", "IRL", 
+   "IMN", "ISR", "ITA", "JAM", "JPN", "JOR", "KAZ", "KEN", "KIR", "PRK", "KOR", 
+   "KWT", "KGZ", "LAO", "LVA", "LBN", "LSO", "LBR", "LBY", "LIE", "LTU", "LUX", 
+   "MAC", "MDG", "MWI", "MYS", "MDV", "MLI", "MLT", "MHL", "MTQ", "MRT", "MUS", 
+   "MYT", "MEX", "FSM", "MDA", "MCO", "MNG", "MNE", "MSR", "MAR", "MOZ", "MMR", 
+   "NAM", "NRU", "NPL", "NLD", "NCL", "NZL", "NIC", "NER", "NGA", "NIU", "MKD", 
+   "MNP", "NOR", "OMN", "PAK", "PLW", "PSE", "PAN", "PNG", "PRY", "PER", "PHL", 
+   "POL", "PRT", "PRI", "QAT", "REU", "ROU", "RUS", "RWA", "SHN", "KNA", "LCA", 
+   "SPM", "VCT", "WSM", "SMR", "STP", "SAU", "SEN", "SRB", "SYC", "SLE", "SGP", 
+   "SXM", "SVK", "SVN", "SLB", "SOM", "ZAF", "SSD", "ESP", "LKA", "SDN", "SUR", 
+   "SWE", "CHE", "SYR", "TWN", "TJK", "TZA", "THA", "TLS", "TGO", "TKL", "TON", 
+   "TTO", "TUN", "TUR", "TKM", "TCA", "TUV", "UGA", "UKR", "ARE", "GBR", "USA", 
+   "URY", "UZB", "VUT", "VEN", "VNM", "VGB", "VIR", "WLF", "ESH", "YEM", "ZMB", "ZWE")
+n_country <- length(codes_iso3)
+# we keep only the outflows/inflows of pairs we do have in the UN stocks
+stock_time <- data.frame(
+  birth = rep(codes_iso3, each = n_country),
+  residence = rep(codes_iso3, times = n_country)) 
+
+y_eurostat <- merge(y_eurostat, stock_time[, c("residence", "birth")], 
+      by.x = c("birth", "REF_AREA"), 
+      by.y = c("birth", "residence"))
+```
+
+Few Statistics on Inflows/outflows:
+
+```{r, fig.width = 9.5, fig.height = 5}
+par(mfcol = c(2, 1), oma = c(0, 0, 0, 0), mar = c(3, 6, 0.5, 0.5), las = 1,
+    mgp = c(4, 1, 0))
+y_eurostat %>%
+  group_by(TIME_PERIOD) %>%
+  summarise(inflows = sum(inflows, na.rm = T)) %>%
+  plot(type = "l", ylim = c(0, 4500000))
+y_eurostat %>%
+  group_by(TIME_PERIOD) %>%
+  summarise(outflows = sum(outflows, na.rm = T)) %>%
+  plot(type = "l", ylim = c(0, 4500000))
+```
+
+Another example between two countries :
+
+```{r, fig.width = 9.5, fig.height = 5}
+par(mfcol = c(2, 1), oma = c(0, 0, 0, 0), mar = c(3, 6, 0.5, 0.5), 
+    las = 1, mgp = c(4, 1, 0))
+y_eurostat %>%
+  filter(birth == "MAR", REF_AREA == "ESP") %>%
+  pivot_longer(cols = 4:5, names_to = "type", values_to = "Flows") %>%
+  ggplot(aes(x = TIME_PERIOD, y = Flows, col = type)) +
+  geom_line() +
+  xlab("Years") +
+  ylab("Migration") + 
+  ggtitle("Movements to and from Spain of Moroccan-Born Individuals") 
+ggsave("figures/spain.pdf", width = 8, height = 3.5)
+```
+
+## Stocks 
+
+Based on the quinquennial stock tables, we interpolate annual stock data (see Subsection 4.1 of the article) and merge it with the outflows/inflows dataset from Eurostat.
+
+```{r}
+stock_long <- data.frame(
+    birth = character(), 
+    REF_AREA = character(),
+    year = numeric(),
+    stock_0_open = numeric(),
+    stock_1_open = numeric(),
+    stock_0_closed = numeric(),
+    stock_1_closed = numeric(),
+    inflows = numeric(),
+    outflows = numeric()
+)
+
+##########.  STOCK. 
+t_time <- as.character(seq(1990, 2020, 5)) 
+  
+for(k in t_time) {
+  load(paste0("results/stock_tot_", k, ".RData"))
+  n_country <- nrow(s1)
+  
+  if(k != "2020") {
+    temp <- data.frame(
+      birth = rep(colnames(s1), each = n_country),
+      residence = rep(colnames(s1), times = n_country), 
+      t0 = as.vector(t(s1)),
+      t5 = as.vector(t(s2)), 
+      t0_open = as.vector(t(s1_open)),
+      t5_open = as.vector(t(s2_open)),
+      t0_closed = as.vector(t(s1_closed)),
+      t5_closed = as.vector(t(s2_closed))) %>%
+      mutate(t1 = t0 + 1 * (t5 - t0) / 5, 
+             t2 = t0 + 2 * (t5 - t0) / 5, 
+             t3 = t0 + 3 * (t5 - t0) / 5, 
+             t4 = t0 + 4 * (t5 - t0) / 5,
+             t1_open = t0_open + 1 * (t5_open - t0_open) / 5, 
+             t2_open = t0_open + 2 * (t5_open - t0_open) / 5, 
+             t3_open = t0_open + 3 * (t5_open - t0_open) / 5, 
+             t4_open = t0_open + 4 * (t5_open - t0_open) / 5,
+             t1_closed = t0_closed + 1 * (t5_closed - t0_closed) / 5, 
+             t2_closed = t0_closed + 2 * (t5_closed - t0_closed) / 5, 
+             t3_closed = t0_closed + 3 * (t5_closed - t0_closed) / 5, 
+             t4_closed = t0_closed + 4 * (t5_closed - t0_closed) / 5
+          ) 
+    
+   # change name 
+   names(temp)[3] <- paste0("s_", as.numeric(k))
+   names(temp)[4] <- paste0("s_", as.numeric(k) + 5)
+   names(temp)[5] <- paste0("s_open_", as.numeric(k)) 
+   names(temp)[6] <- paste0("s_open_", as.numeric(k) + 5) 
+   names(temp)[7] <- paste0("s_closed_", as.numeric(k))  
+   names(temp)[8] <- paste0("s_closed_", as.numeric(k) + 5)  
+   names(temp)[9:12] <- paste0("s_", as.numeric(k) + c(1, 2, 3, 4))
+   names(temp)[13:16] <- paste0("s_open_", as.numeric(k) + c(1, 2, 3, 4))
+   names(temp)[17:20] <- paste0("s_closed_", as.numeric(k) + c(1, 2, 3, 4))
+   
+  } else {
+    temp <- data.frame(
+      birth = rep(colnames(s1), each = n_country),
+      residence = rep(colnames(s1), times = n_country), 
+      t0 = as.vector(t(s1)),
+      t4 = as.vector(t(s2)), 
+      t0_open = as.vector(t(s1_open)),
+      t4_open = as.vector(t(s2_open)),
+      t0_closed = as.vector(t(s1_closed)),
+      t4_closed = as.vector(t(s2_closed))) %>%
+      filter(birth != residence) %>%
+      mutate(t1 = t0 + 1 * (t4 - t0) / 4, 
+             t2 = t0 + 2 * (t4 - t0) / 4, 
+             t3 = t0 + 3 * (t4 - t0) / 4, 
+             t1_open = t0_open + 1 * (t4_open - t0_open) / 4, 
+             t2_open = t0_open + 2 * (t4_open - t0_open) / 4, 
+             t3_open = t0_open + 3 * (t4_open - t0_open) / 4, 
+             t1_closed = t0_closed + 1 * (t4_closed - t0_closed) / 4, 
+             t2_closed = t0_closed + 2 * (t4_closed - t0_closed) / 4, 
+             t3_closed = t0_closed + 3 * (t4_closed - t0_closed) / 4) 
+    
+    names(temp)[3] <- paste0("s_", as.numeric(k))
+    names(temp)[4] <- paste0("s_", as.numeric(k)+4)  
+    names(temp)[5] <- paste0("s_open_", as.numeric(k))  
+    names(temp)[6] <- paste0("s_open_", as.numeric(k)+4)     
+    names(temp)[7] <- paste0("s_closed_", as.numeric(k)) 
+    names(temp)[8] <- paste0("s_closed_", as.numeric(k)+4)     
+    names(temp)[9:11] <- paste0("s_", as.numeric(k) + c(1, 2, 3))
+    names(temp)[12:14] <- paste0("s_open_", as.numeric(k) + c(1, 2, 3))
+    names(temp)[15:17] <- paste0("s_closed_", as.numeric(k) + c(1, 2, 3))
+  }
+  
+   ######. merge with outflows / inflows
+  for(my_year in (as.numeric(k)):(as.numeric(k)+ 4)) {
+    
+    if(my_year == 2024)
+      break
+    
+    est_year <- y_eurostat %>%
+      filter(TIME_PERIOD == my_year) %>%
+      merge(temp[, c("residence", "birth", 
+                           names(temp)[substr(names(temp), nchar(names(temp)) - 3, nchar(names(temp))) %in% c(my_year, my_year + 1)])], 
+          by.x = c("birth", "REF_AREA"), 
+          by.y = c("birth", "residence"), all = T) 
+
+    # filter 0 and 1values
+    # initialization
+
+    stock_0_open <- est_year[[paste0("s_open_", my_year)]]
+    stock_1_open <- est_year[[paste0("s_open_", my_year + 1)]]
+    delta_1_open <- (stock_1_open - stock_0_open)
+
+    stock_0_closed <- est_year[[paste0("s_closed_", my_year)]]
+    stock_1_closed <- est_year[[paste0("s_closed_", my_year + 1)]]
+    delta_1_closed <- (stock_1_closed - stock_0_closed)
+    
+    in_flows <- est_year$inflows
+    out_flows <- est_year$outflows
+    
+    stock_long <- rbind(stock_long, data.frame(
+      birth = est_year$birth, 
+      REF_AREA = est_year$REF_AREA,
+      year = my_year,
+
+      stock_0_open = stock_0_open,
+      stock_1_open = stock_1_open,
+      diff_open = delta_1_open,
+      
+      stock_0_closed = stock_0_closed,
+      stock_1_closed  = stock_1_closed,
+      diff_closed  = delta_1_closed,
+      
+      outflows = out_flows,
+      inflows = in_flows
+    ))
+  }
+}
+```
+
+
+## Prediction of outflows/inflows using a NLS model
+
+For both open and closed adjusted stocks, we fit a Nonlinear Least Squares (NLS) model to explain outflows (respectively, inflows) as a function of the stock at time $t$ (respectively, 
+$t+1$). The following code produces the estimates presented in Table 3 of the article (corresponding to the models specified in Equations 19 and 20), as well as the results shown in Figure 6, which compares the performance of the Nonlinear Least Squares (NLS) and the Ordinary Linear Model (OLM) regressions.
+
+```{r, fig.width = 12, fig.height = 6}
+# filter the data
+all_data_outflows <- stock_long %>% filter(
+  birth != REF_AREA,
+  !is.na(stock_long$outflows),
+  !(birth == "RUS" & REF_AREA == "UKR"))
+exlude_out <- stock_long %>% filter(
+  birth != REF_AREA,
+  !is.na(stock_long$outflows),
+  (birth == "RUS" & REF_AREA == "UKR"))
+all_data_inflows <- stock_long %>% filter(
+  birth != REF_AREA,
+  !is.na(stock_long$inflows),
+  inflows < 200000)
+exlude_in <- stock_long %>% filter(
+  birth != REF_AREA,
+  !is.na(stock_long$inflows),
+  inflows > 200000)
+
+###### results 
+res_paper <- data.frame(type = character(),
+                      type_flows = character(),
+                      alpha = numeric(),
+                      beta = numeric(),
+                      RMSE_NLS = numeric(), 
+                      RMSE_OLM = numeric(),
+                      size = numeric())
+# NLS
+nls_outflows <- vector("list", 2)
+nls_inflows <- vector("list", 2)
+names(nls_outflows) = names(nls_inflows) = c("open", "closed")
+
+ pdf("figures/lm_eurostat.pdf", width = 8, height = 6)
+par(mfcol = c(2, 2), oma = c(0, 0, 0, 0), mar = c(3.2, 3.9, 1, 0.4),
+    mgp = c(2.9, 0.6, 0), las = 1)
+
+ind_stock <- c(4, 5, 6)
+
+for(type in c("open", "closed")) {
+
+  temp_all_data_outflows <- all_data_outflows[, c(1, 2, 3, ind_stock, 10, 11)]
+  names(temp_all_data_outflows)[c(4, 5, 6)] <- c("stock_0", "stock_1", "diff")
+  
+  temp_all_data_inflows <- all_data_inflows[, c(1, 2, 3, ind_stock, 10, 11)]
+  names(temp_all_data_inflows)[c(4, 5, 6)] <- c("stock_0", "stock_1", "diff")
+  
+  temp_all_data_outflows <- temp_all_data_outflows %>% 
+    filter(outflows > 0, stock_0 >= outflows) %>%
+    mutate(rate_outflows = outflows / stock_0)
+
+  temp_all_data_inflows <- temp_all_data_inflows %>% 
+    filter(inflows > 0,  stock_1 >= inflows) %>%
+    mutate(rate_inflows = inflows / stock_1)
+
+  # computation of the regression coefficients for outflows
+  # Plot 
+  plot(outflows ~ stock_0, data = temp_all_data_outflows, cex = 0.3, pch = 16,
+       xlim = c(0, 3200000), ylim = c(0, 75000), xlab = "Stock at time t  \n",
+       ylab = "outflows  ")
+
+  if (type == "open") {
+    points(exlude_out$stock_0_open, exlude_out$outflows, pch = 4,
+         col = "red") 
+    title("Open Adjustement")
+  } else {
+    points(exlude_out$stock_0_closed, exlude_out$outflows, pch = 4,
+         col = "red") 
+    title("Closed Adjustement")
+  }
+  x_pred <- data.frame(stock_0 = seq(0, 3200000, length.out = 1000))
+
+  temp_123 <- lm(outflows ~ stock_0, data = temp_all_data_outflows) 
+  abline(temp_123, lty = 2, col = "cyan", lwd = 2)
+  my_pred <- predict(temp_123)
+  rmse_olm <- sqrt(mean(((my_pred - temp_all_data_outflows$outflows)) ^ 2))
+  
+  nls_outflows[[type]] <- nls(outflows ~ a * stock_0 / (b + stock_0), 
+            data = temp_all_data_outflows, start = list(a = 1, b = 1))
+  pred_nls <- predict(nls_outflows[[type]], newdata = x_pred)
+  lines(x_pred$stock_0, pred_nls, lty = 2, col = "magenta", lwd = 2)
+  my_pred <- predict(nls_outflows[[type]])
+  rmse_nls <- sqrt(mean(((my_pred - temp_all_data_outflows$outflows)) ^ 2))
+  
+  res_paper <- rbind(res_paper, 
+                     data.frame(
+                       type = type,
+                      type_flows = "outflows",
+                      alpha = coefficients(nls_outflows[[type]])[1],
+                      beta = coefficients(nls_outflows[[type]])[2],
+                      RMSE_NLS = rmse_nls, 
+                      RMSE_OLM = rmse_olm,
+                      size = nrow(temp_all_data_outflows)))
+  ########################################################
+  #  inflows 
+
+  # Plot 
+  plot(inflows ~ stock_1, data = temp_all_data_inflows, cex = 0.3, pch = 16,
+       xlim = c(0, 3200000), ylim = c(0, 763000), xlab = "Stock at time t + 1 \n",
+       ylab = "inflows   ")
+  if (type == "open") {
+    points(exlude_in$stock_1_open, exlude_in$inflows, pch = 4, col = "red") 
+  } else {
+    legend("topright", legend = c("LM", "NLS", "influential pts"), 
+         lty = c(2, 2, NA), col = c("cyan", "magenta", "red"), 
+         pch = c(NA, NA, 4), cex = c(0.8, 0.8, 0.8))
+    points(exlude_in$stock_1_closed, exlude_in$inflows, pch = 4, col = "red") 
+  }
+  x_pred <- data.frame(stock_1 = seq(0, 3200000, length.out = 1000))
+
+  temp_123 <- lm(inflows ~ stock_1 - 1, data = temp_all_data_inflows)
+  abline(temp_123, lty = 2, col = "cyan", lwd = 2)
+  
+  my_pred <- predict(temp_123)
+  rmse_olm <- sqrt(mean(((my_pred - temp_all_data_inflows$inflows)) ^ 2))
+
+  x_pred <- data.frame(stock_1 = seq(0, 10000000, length.out = 1000))
+  nls_inflows[[type]] <- nls(inflows ~ a * stock_1 / (b + stock_1), 
+           data = temp_all_data_inflows, start = list(a = 0.12345, b = 0.54321))
+  
+  pred_nls <- predict(nls_inflows[[type]], newdata = x_pred)
+  lines(x_pred$stock_1, pred_nls, lty = 2, col = "magenta", lwd = 2)
+  my_pred <- predict(nls_inflows[[type]])
+  rmse_nls <- sqrt(mean(((my_pred - temp_all_data_inflows$inflows)) ^ 2))
+
+    res_paper <- rbind(res_paper, 
+                     data.frame(
+                       type = type,
+                      type_flows = "inflows",
+                      alpha = coefficients(nls_inflows[[type]])[1],
+                      beta = coefficients(nls_inflows[[type]])[2],
+                      RMSE_NLS = rmse_nls, 
+                      RMSE_OLM = rmse_olm,
+                      size = nrow(temp_all_data_inflows)))
+    
+  ind_stock <- ind_stock + 3  
+}
+ dev.off()
+```
+
+We generate outflow and inflow predictions for the entire sample—covering all country-of-residence / country-of-birth pairs—from 1990 to 2024, based on the adjusted Open and Closed stock tables.
+
+```{r, eval = T}
+for(type in c("open", "closed")) {
+  for(type_flows in c("outflows", "inflows")) {
+    ## NLS
+    if(type_flows == "outflows") {
+      stock_long[, paste0("hat_", type_flows, "_", type)] <- 
+        predict(nls_outflows[[type]], newdata = 
+      data.frame(stock_0 = stock_long[, 
+            paste0("stock_", ifelse(type_flows == "outflows", 0, 1), "_", type)]))
+    } else {
+        stock_long[, paste0("hat_", type_flows, "_", type)] <- 
+        predict(nls_inflows[[type]], newdata = 
+      data.frame(stock_1 = stock_long[, 
+            paste0("stock_", ifelse(type_flows == "outflows", 0, 1), "_", type)]))
+    }
+  }
+}
+pred_out_in_flows <- stock_long %>%
+  pivot_longer(cols = 12:15, names_to = "method", values_to = "hat_values") %>%
+  mutate(method = substr(method, 5, nchar(method))) 
+
+pred_out_in_flows$type_flows <- ifelse(substr(pred_out_in_flows$method, 1, 2) == "ou",
+                                       "outflows", "inflows")
+pred_out_in_flows$type <- ifelse(
+  substr(pred_out_in_flows$method, 
+         nchar(pred_out_in_flows$method),
+         nchar(pred_out_in_flows$method)) == "n", "open", "closed")
+
+pred_out_in_flows$values <- ifelse(pred_out_in_flows$type_flows == "outflows", pred_out_in_flows$outflows, pred_out_in_flows$inflows)
+``` 
+
+
+```{r, fig.width = 8, fig.height = 6, warning = F, message = F}
+pred_out_in_flows %>% 
+  filter(!is.na(values)) %>%
+  ggplot(aes(x = values, y = hat_values)) +
+  geom_point() +
+  xlim(0, 100000) + 
+  ylim(0, 100000) + 
+  geom_smooth(method = 'lm') +
+  facet_grid(type ~ type_flows)
+```
+
+
+```{r, echo = F, eval = F }
+# Illustration in the paper : 
+m1 <- matrix(c(54788000, 204000, 36000, 117000,
+               254000, 38155000, 4000, 35000,
+               1024000, 934000, 35535000, 443000,
+               308000,   142000,     2000, 51142000), byrow = T, 4, 4)
+m2 <- matrix(c(54772000, 214000,    43000,   116000,
+               263000, 38142000,     5000,    38000,
+               1029000,  1030000, 35419000,   458000,
+               302000,   163000,     2000, 51127000), byrow = T, 4, 4) 
+
+hat_outflows <- predict(nls_outflows[["closed"]], newdata = data.frame(
+  stock_0 = as.vector(m1)))
+hat_inflows <- predict(nls_inflows[["closed"]], newdata = data.frame(
+  stock_1 = as.vector(m2)))
+
+# rule to compute stayers
+Z1 <- as.vector(m1) - hat_outflows
+Z2 <- as.vector(m2) - hat_inflows
+Z <- matrix(ifelse(Z1 <= pmin(as.vector(m1), as.vector(m2) ), Z1, Z2),
+            4, 4)
+diag(Z) <- c(
+  m2[1, 1] - sum(m1[1, -1] - Z[1, -1]) * 0.6391184,
+  m2[2, 2] - sum(m1[2, -2] - Z[2, -2]) * 0.6391184,
+  m2[3, 3] - sum(m1[3, -3] - Z[3, -3]) * 0.6391184,
+  m2[4, 4] - sum(m1[4, -4] - Z[4, -4]) * 0.6391184)
+
+mass_0 <- round(m1[1, ] - Z[1, ])
+mass_1 <- round(m2[1, ] - Z[1, ])
+my_cost <- matrix(ifelse(m1[1, ] == 0, 1, 1/m1[1, ]), 4, 4, byrow = T)
+diag(my_cost) <- 10^9
+temp <- Barycenter::Sinkhorn(matrix(mass_0, ncol = 1), 
+                         matrix(mass_1, ncol = 1), 
+                     my_cost, lambda = 1, maxIter = 10000, 
+                     tolerance=10^(-3))$Transportplan
+addmargins(round(temp, 1))
+
+mass_0 <- round(m1[2, ] - Z[2, ])
+mass_1 <- round(m2[2, ] - Z[2, ])
+my_cost <- matrix(ifelse(m1[2, ] == 0, 1, 1/m1[2, ]), 4, 4, byrow = T)
+diag(my_cost) <- 10^9
+temp <- Barycenter::Sinkhorn(matrix(mass_0, ncol = 1), 
+                         matrix(mass_1, ncol = 1), 
+                     my_cost, lambda = .01, maxIter = 10000, 
+                     tolerance=10^(-3))$Transportplan
+addmargins(round(temp, 1))
+
+mass_0 <- round(m1[3, ] - Z[3, ])
+mass_1 <- round(m2[3, ] - Z[3, ])
+my_cost <- matrix(ifelse(m1[3, ] == 0, 1, 1/m1[3, ]), 4, 4, byrow = T)
+diag(my_cost) <- 10^9
+temp <- Barycenter::Sinkhorn(matrix(mass_0, ncol = 1), 
+                         matrix(mass_1, ncol = 1), 
+                     my_cost, lambda = .01, maxIter = 10000, 
+                     tolerance=10^(-3))$Transportplan
+addmargins(round(temp, 1))
+
+
+mass_0 <- round(m1[4, ] - Z[4, ])
+mass_1 <- round(m2[4, ] - Z[4, ])
+my_cost <- matrix(ifelse(m1[4, ] == 0, 1, 1/m1[4, ]), 4, 4, byrow = T)
+diag(my_cost) <- 10^9
+temp <- Barycenter::Sinkhorn(matrix(mass_0, ncol = 1), 
+                         matrix(mass_1, ncol = 1), 
+                     my_cost, lambda = .01, maxIter = 10000, 
+                     tolerance=10^(-3))$Transportplan
+addmargins(round(temp, 1))
+```
+
+
+## Auxiliary data from IMEM
+
+We use the IMEM database to calibrate the estimated percentage of return migration (Subsection 4.3 and Appendix B2 in the article). 
+
+### Import the IMEM data 
+
+The database is available [here](https://zenodo.org/records/8224827) 
+
+```{r, message = F}
+# correspondance between iso
+# url <- "http://en.wikipedia.org/wiki/ISO_3166-1"
+# tables_url_wiki <- url %>%
+#   read_html() %>%
+#   html_nodes("table") %>%
+#   html_table(fill = T)
+# table_iso <- tables_url_wiki[[3]]
+# save(table_iso, file = "table_iso.RData")
+load("results/table_iso.RData")
+# year 2002 - 2008
+imem <- readxl::read_xlsx("data/IMEM_final_results2.xlsx")
+temp_imem <- as.matrix(imem[which(imem[, 1] == "median"), 
+                            -c(1, 2, (ncol(imem)-20):ncol(imem))])
+
+imem_median <- as.numeric(as.vector(t(temp_imem[-c(nrow(temp_imem)-2, nrow(temp_imem)-1, 
+                                                   nrow(temp_imem)), ])))
+
+nom_country_iso2 <- c("AT", "BE", "BG", "CH", "CY", "CZ", "DE", "DK", "EE", "ES", "FI",
+                      "FR", "GR", "HU" , "IE", "IS", "IT", "LI", "LT", "LU", "LV", "MT",
+                      "NL", "NO", "PL", "PT", "RO" , "SE", "SI", "SK", "GB")
+nom_country_imem <- character(length(nom_country_iso2))
+temp <- as.data.frame(table_iso) 
+for(k in 1:length(nom_country_iso2)) {
+  nom_country_imem[k] <- temp[which(temp[, 2] == nom_country_iso2[k]), 3]
+}
+
+y_imem = data.frame(
+  origin = rep(nom_country_imem, each = length(nom_country_imem) * length(2002:2008)), 
+  years = rep(2002:2008, times = length(nom_country_imem) ^ 2), 
+  dest = rep(rep(nom_country_imem, each = length(2002:2008)), times = length(nom_country_imem)),
+                      flow = imem_median)
+
+# 2nd part of the data 
+imem_2 <- read.csv(file = "data/flows_ODT_long.csv")
+nom_full <- unique(imem_2$origin)
+
+nom_country_imem <- character(length(nom_full))
+temp <- as.data.frame(table_iso) 
+for(k in 1:length(nom_full)) {
+  candidate <- temp[which(temp[, 1] == nom_full[k]), 3] 
+  nom_country_imem[k] <- ifelse(length(candidate) == 1,
+                                temp[which(temp[, 1] == nom_full[k]), 3],
+                                "")
+}
+
+nom_country_imem[5] <- "CYP"
+nom_country_imem[22] <- "NLD"
+nom_country_imem[32] <- "GBR"
+
+for(k in 1:length(nom_full)) {
+  imem_2[which(imem_2$origin == nom_full[k]), "origin"] <- nom_country_imem[k]
+  imem_2[which(imem_2$dest == nom_full[k]), "dest"] <- nom_country_imem[k]
+}
+imem_2 <- imem_2[imem_2$origin != "", ]
+imem_2 <- imem_2[imem_2$dest != "", ]
+imem_2 <- imem_2[!is.na(imem_2$flow_50.), ]
+
+y_imem = rbind(y_imem,
+               data.frame(origin = imem_2$origin,
+                          years = imem_2$year, 
+                          dest = imem_2$dest,
+                          flow = imem_2$flow_50.))
+
+# drop intra 
+y_imem <- y_imem[y_imem$origin != y_imem$dest, ]
+
+# population data
+temp_iso <- table_iso[, c(3, 4)]
+names(temp_iso) <- c("origin", "M49")
+my_pop <- wpp2024 %>%
+     dplyr::select(5, 11, 12) %>%
+     rename(M49 = 1, years = 2, pop = 3) %>%
+     merge(temp_iso, by = "M49")
+my_pop$pop <- as.numeric(my_pop$pop)
+```
+
+
+### Optimization 
+
+We implement a function, `my_function_to_opti()`, designed to find the optimal $\alpha$ parameters that minimize the LSER criterion (see Appendix B2 in the article).
+
+```{r, eval = T}
+my_function_to_opti <- function(to_opti, type = "closed", type_res = "LSER") {
+
+  cat("-")
+  unique_years <- unique(y_imem$year)
+  nT <- length(unique_years)
+  # initialization
+  temp <- stock_long %>%
+  filter(year %in% unique_years)
+  n <- length(unique(temp$birth))
+  
+  for(k_years in 1:nT) {
+    my_data <- stock_long %>%
+      filter(year == unique_years[k_years])
+    # initialization
+    stock_0 <- my_data[, paste0("stock_0_", type)]
+    stock_1 <- my_data[, paste0("stock_1_", type)]
+    birth <- my_data[ , "birth"]
+    residence <- my_data[ , "REF_AREA"]
+    hat_outflows <- my_data[ , paste0("hat_outflows_", type)]
+    hat_inflows <- my_data[ , paste0("hat_inflows_", type)]
+    my_esti <- my_transport(stock_0, stock_1, birth, residence, hat_outflows, 
+                         hat_inflows, rate_returns = to_opti)$res
+    temp[((k_years - 1) * n^2 + 1):(k_years * n^2), "esti"] <- as.vector(t(my_esti))
+}
+
+  temp <- merge(temp, y_imem, by.x = c("birth", "REF_AREA", "year"),
+                by.y = c("origin", "dest", "years"))
+  temp <- merge(temp, my_pop, 
+                by.x = c("birth", "year"),
+                by.y = c("origin", "years"))
+  if (type_res == "LSER")
+    return(mean(((temp$flow - temp$esti) / temp$pop) ^ 2)) 
+  else
+    return(cbind(temp$flow , temp$esti))
+}
+```
+
+
+```{r, eval = F}
+optimize(my_function_to_opti, c(0, 1), type = "closed")
+# 0.6424708
+optimize(my_function_to_opti, c(0, 1), type = "open")
+# 0.6757961
+```
+
+
+We plot the scatterplot of the observed flows $F_{ij}^{\text{IMEM}}(t)$ versus the estimated flows $\hat{F}_{ij}(t)$, using the optimal values of $\alpha$ (figure 7 in the article).
+
+```{r, fig.width = 8, fig.height = 4}
+# IMEM 
+y_closed_nls <- my_function_to_opti(0.6424708, type = "closed", type_res = "data")
+y_open_nls <- my_function_to_opti(0.6757961, type = "open", type_res = "data")
+
+pdf("figures/imem.pdf", width = 9, height = 4)
+par(mfrow = c(1, 2), oma = c(0, 0, 0, 0), mar = c(3.8, 4.3, 0.5, 0.8), 
+    mgp = c(3.4, 0.65, 0), las = 1)
+plot(y_closed_nls[, 1], y_closed_nls[, 2], xlab = "Flows (IMEM data) \n", 
+     ylab = "Est. Flows using OT on closed data", xlim = c(0, 140000), ylim = c(0, 140000))
+abline(0, 1, lty = 2, col = "grey")
+plot(y_open_nls[, 1], y_open_nls[, 2], xlab = "Flows (IMEM data) \n", ylab = "Est. Flows using OT on open data",
+     xlim = c(0, 140000), ylim = c(0, 140000))
+abline(0, 1, lty = 2, col = "grey")
+dev.off()
+```
+
+# Simulation procedure 
+
+The algorithm is fully described in Section 5 of the article and in Appendix C.
+
+## Distribution of Input Parameters in the Simulation Framework
+
+We plot the scatter plot of the pairs $(a^i_j, b^i_j)$, grouped by country of residence $j$, where $j$ is one of the following countries: Austria, Belgium, Bulgaria, Switzerland, Czech Republic, Germany, Denmark, Spain, Estonia, Finland, Croatia, Hungary, Ireland, Iceland, Italy, Liechtenstein, Lithuania, Luxembourg, Latvia, North Macedonia, Netherlands, Norway, Romania, Slovakia, Slovenia, Sweden (figure 8 in the article):
+
+```{r}
+data_simu <- stock_long %>% 
+  mutate(outflow_rate_open = outflows / stock_0_open,
+         outflow_rate_closed = outflows / stock_0_closed,
+         rate_inflows_outflows = inflows / outflows) %>%
+  filter(!is.na(outflow_rate_open), !is.na(rate_inflows_outflows),
+         stock_0_open > 0, stock_0_closed > 0, outflows > 0, inflows > 0) %>%
+  filter(birth %in% REF_AREA)
+
+# outflows 
+data_simu_outflows  <- data_simu %>% 
+  select(birth, REF_AREA, year, outflow_rate_open)  %>% 
+  pivot_wider(names_from = "birth", 
+              values_from = c("outflow_rate_open")) 
+
+temp_na <- as.matrix(data_simu_outflows[, -1])
+temp_na_2 <- temp_na[, -1]
+
+# we replace the large values of outflows (larger than 1) by NA
+temp_na_2[temp_na_2 > 0.3 | temp_na_2 < 0.0001] <- NA
+temp_na[, -1] <- temp_na_2
+data_simu_outflows[, -1] <- missForest::missForest(temp_na)$ximp
+
+# inflows 
+data_simu_inflows  <- data_simu %>% 
+  select(birth, REF_AREA, year, rate_inflows_outflows)  %>% 
+  pivot_wider(names_from = "birth", 
+              values_from = c("rate_inflows_outflows")) 
+
+temp_na <- as.matrix(data_simu_inflows[, -1])
+temp_na_2 <- temp_na[, -1]
+
+# we replace the large values of rate of inflows (larger than 5) by NA
+temp_na_2[temp_na_2 > 8 | temp_na_2 < 0.1] <- NA
+temp_na[, -1] <- temp_na_2
+data_simu_inflows[, -1] <- missForest::missForest(temp_na)$ximp
+
+unique_country <- sort(unique(data_simu_inflows$REF_AREA))
+
+#####
+temp_plot <- data.frame(a = as.vector(as.matrix(data_simu_outflows[, -c(1, 2)])),
+                        b = as.vector(as.matrix(data_simu_inflows[, -c(1, 2)])),
+                        REF_AREA = as.vector(as.matrix(data_simu_outflows[, 1])),
+                        birth = rep(colnames(data_simu_outflows[, -c(1, 2)]), nrow(data_simu_outflows)),
+                        year = factor(as.vector(as.matrix(data_simu_outflows[, 2]))))
+```
+
+
+```{r, fig.width = 8, fig.height = 5.5}
+temp_plot %>% 
+ # filter(year == 2021) %>%
+  ggplot(aes(x = a, y = b)) +
+  geom_point(aes( colour = birth), size = 0.2) + 
+  # geom_density_2d() + 
+  facet_wrap(~REF_AREA)
+ ggsave("figures/a_b.pdf", width = 8, height = 5.5)
+```
+
+We plot the distribution of the $\text{Beta}(6.5, 3.5)$ distribution used to simulate the parameter $\alpha_i$ introduced in Step 3 of the simulation process (figure 9 in the article).
+
+```{r, fig.width = 7, fig.height = 5 }
+ pdf("figures/beta.pdf", width = 7, height = 5)
+par(las = 1, mar = c(3.8, 4, 0.5, 0.5), mgp = c(2.5, 1, 0))
+x_seq <- seq(0, 1, length.out = 100)
+plot(x_seq, dbeta(x_seq, 6.5, 3.5), type = "l",
+     xlab = "alpha", ylab = "Probability Density")
+dev.off()
+```
+
+## Algorithm
+
+We implement the algorithm described in Section 5 of the article:
+
+```{r}
+names_method_esti <- c("drop", "reverse", "OT", "mig. rate", "IPFP", "PB") 
+        #  "drop (year)", "reverse (year)", "mig. rate (year)", "IPFP (year)", "PB (year)")
+nb_method_esti <- length(names_method_esti)
+nb_rep <- 100
+mae_tab <- mape_tab <- rmse_tab <- matrix(0, nb_rep, nb_method_esti)
+n <- 230
+```
+
+```{r, eval = F}
+my_M <- numeric(nb_rep)
+res <- data.frame(
+  Method = character(nb_method_esti * nb_rep * n * (n - 1)),
+  outwards =  numeric(nb_method_esti * nb_rep * n * (n - 1)),
+  returns =  numeric(nb_method_esti * nb_rep * n * (n - 1)),
+  transit =  numeric(nb_method_esti * nb_rep   * n * (n - 1)),
+  MAE = numeric(nb_method_esti * nb_rep  * n * (n - 1)),
+  estimation = numeric(nb_method_esti * nb_rep  * n * (n - 1)),
+  sign_estimation = character(nb_method_esti * nb_rep  * n * (n - 1)),
+  Y = numeric(nb_method_esti * nb_rep  * n * (n - 1)),
+  RMAE = numeric(nb_method_esti * nb_rep  * n * (n - 1)),
+  MSE = numeric(nb_method_esti * nb_rep  * n * (n - 1)),
+  RMSE = numeric(nb_method_esti * nb_rep  * n * (n - 1))
+)
+increment <- 1:(nb_method_esti * n * (n - 1))
+
+# for the best predictor
+best_pred <- character(nb_rep  * n * (n - 1))
+increment_best <- 1:(n * (n - 1))  
+
+countries <- LETTERS[1:n]
+system.time(
+# parameters for rate of outflows
+for(b in 1:nb_rep) {
+  print(b)
+  set.seed(b)
+  load(file = paste0("results/stock_tot_", 
+                     sample(seq(1990, 2020, 5), size = 1), ".RData"))
+  mat_for_simu <- s1_closed
+  mat_for_simu[mat_for_simu == 0] <- 1
+  choose_country <- sample(1:230, n)
+  S1 <- mat_for_simu[choose_country, choose_country]
+
+  # choose n countries with replacement in the basis of a/b
+  outflow_rate <- inflow_rate <- matrix(0, n, n)
+  samp_a <- sample(unique_country, size = n, replace = T)
+  # for each country select a year randomly and choose out/in
+  for(i in 1:n){
+    # outflows
+    temp_basis <- data_simu_outflows %>%
+      filter(REF_AREA == samp_a[i]) %>%
+      select(-year, -REF_AREA)
+    
+    # select a year randomly
+    id_sample <- sample(1:nrow(temp_basis), size = 1)
+    outflow_rate[i, ] <- as.numeric(temp_basis[id_sample, samp_a])
+    
+    # inflows
+    temp_basis <- data_simu_inflows %>%
+      filter(REF_AREA == samp_a[i]) %>%
+      select(-year, -REF_AREA)
+    inflow_rate[i, ] <- as.numeric(temp_basis[id_sample, samp_a])
+  }
+  
+  # true flows
+  Y <- matrix(0, nrow = n, ncol = n, 
+              dimnames = list(From = countries, To = countries))
+  S1_all <- S1
+
+  alpha_i <- numeric(n)
+  mat_outwards <- matrix(0, n, n)
+  mat_returns <- matrix(0, n, n)
+  mat_transit <- matrix(0, n, n)
+      
+  # Creation de la matrice F
+  my_F <- vector("list", n)
+      
+  for(years in 1:5) {
+    # Initialisation de la matrice de flux people born in i
+    for (i in 1:n){
+       my_F[[i]] <- matrix(0, nrow = n, ncol = n, 
+              dimnames = list(From = countries, To = countries))
+     }
+    S2_all <- matrix(0, nrow = n, ncol = n, 
+                   dimnames = list(From = countries, To = countries))
+        
+    for (i in 1:n) {
+     # Taux de retour (alpha)
+      if (years == 1) {
+           alpha_i[i] <- rbeta(1, 6.5, 3.5)  
+       }
+
+     total_out <- S1_all[i, ] * outflow_rate[i, ]
+         
+     # Retours
+     return_flow <- alpha_i[i] * total_out[-i]
+     my_F[[i]][-i, i] <- return_flow
+
+     # Transit : réparti aléatoirement sur les autres pays
+     transit_flow <- (1 - alpha_i[i]) * total_out
+     for(k in (1:n)[-i]) {
+        temp_transit <- as.numeric(rmultinom(1, size = as.numeric(transit_flow[k]), S1_all[i, -c(i, k)]))
+        my_F[[i]][k, -c(i, k)] <- temp_transit
+      }
+          
+     # outwards : we drop from the inflows the transit
+     total_in <- total_out * inflow_rate[i, ] - colSums(my_F[[i]])
+     my_F[[i]][i, -c(i)] <- ifelse(total_in[-i] > 0, total_in[-i], -total_in[-i] / 2)
+
+     # we stock the results by group
+     mat_returns[-i, i] <- mat_returns[-i, i] + my_F[[i]][-i, i] 
+     for(k in (1:n)[-i]) {
+        mat_transit[k, -c(i, k)] <- mat_transit[k, -c(i, k)] + my_F[[i]][k, -c(i, k)]
+     }
+     mat_outwards[i, -c(i)] <- mat_outwards[i, -c(i)] + my_F[[i]][i, -c(i)] 
+          
+     # stayers
+     diag(my_F[[i]]) <- S1_all[i, ] - rowSums(my_F[[i]])
+          
+     # stock tables 
+     S2_all[i, ] <- colSums(my_F[[i]])
+          
+     Y <- Y + my_F[[i]]
+    }
+   # update stock tables 
+   S1_all <- S2_all
+   }   
+      
+   diag(Y) <- 1 
+      
+   # estimates
+   hat_drop <- my_diff(S1, S2_all, type = "drop")
+   hat_reverse <- my_diff(S1, S2_all, type = "reverse")
+   M <- sum(abs(apply(S2_all, 2, sum)  - apply(S1, 2, sum)))
+   mig_rate <- round(M * (S1) / (sum(S1) - sum(diag(S1))))
+   diag(mig_rate) <- 0
+   hat_min_closed <- my_min(S1, S2_all)
+   hat_pb <- 0.87 * hat_min_closed + (1 - 0.87) * bayes(S1, S2_all)
+   diag(hat_pb) <- 0
+      
+   # For transport
+   hat_transport <- matrix(0, n, n)
+   
+#   hat_drop_yearly <- hat_reverse_yearly <- 
+#     mig_rate_yearly <- hat_min_closed_yearly <- 
+#     hat_pb_yearly <- matrix(0, n, n)
+   
+   # Compute stocks tables per year
+   s_year_t0 <- S1
+   for(time_k in 1:5) {
+      s_year_t1 = S1 + time_k * (S2_all - S1) /  5
+      # vectorize
+      new_data <- data.frame(
+      stock_0 = as.vector(s_year_t0), 
+      stock_1 = as.vector(s_year_t1),
+      birth = rep(row.names(S1), n),
+      residence = rep(row.names(S1), each = n))
+        
+      hat_outflows <- predict(nls_outflows[["closed"]], newdata = new_data)
+      hat_inflows <- predict(nls_inflows[["closed"]], newdata = new_data)
+  
+      temp_time <- my_transport(new_data$stock_0, new_data$stock_1, 
+                                new_data$birth, new_data$residence, 
+                                hat_outflows, hat_inflows, rate_returns = 0.6424708)$res
+      hat_transport <- hat_transport + temp_time
+      
+      # other methods computed year by year
+        # estimates
+      #hat_drop_yearly <- hat_drop_yearly + 
+      #  my_diff(s_year_t0, s_year_t1, type = "drop")
+      #hat_reverse_yearly <- hat_reverse_yearly + 
+      #  my_diff(s_year_t0, s_year_t1, type = "reverse")
+      #M <- sum(abs(apply(s_year_t1, 2, sum)  - apply(s_year_t0, 2, sum)))
+      #mig_rate_yearly <- mig_rate_yearly + 
+      #  round(M * (s_year_t0) / (sum(s_year_t0) - sum(diag(s_year_t0))))
+      #temp_min <- my_min(s_year_t0, s_year_t1)
+      #hat_min_closed_yearly <- hat_min_closed_yearly + temp_min
+      #hat_pb_yearly <- hat_pb_yearly + 
+      #  0.87 * temp_min + (1 - 0.87) * bayes(s_year_t0, s_year_t1)
+      
+      # initialize
+      s_year_t0 <- s_year_t1
+    }
+      
+    #  diag(mig_rate_yearly) <- 0
+    #  diag(hat_pb_yearly) <- 0
+      
+    ind_h_diag <- cbind(rep(1:n, each = n), 
+                          rep(1:n, times = n))
+    ind_h_diag <- ind_h_diag[!(ind_h_diag[, 1] == ind_h_diag[, 2]), ]
+    # Error due to M for the migration rate method
+    my_M[b] <- M / sum(Y[ind_h_diag])
+    # metrics computed                   
+    RMAE <- c(((abs(Y - hat_drop)/Y))[ind_h_diag],
+               ((abs(Y - hat_reverse)/Y))[ind_h_diag],
+               ((abs(Y - hat_transport)/Y))[ind_h_diag],
+               ((abs(Y - mig_rate)/Y))[ind_h_diag],
+               ((abs(Y - hat_min_closed)/Y))[ind_h_diag],
+               ((abs(Y - hat_pb)/Y))[ind_h_diag] 
+       #       ((abs(Y - hat_drop_yearly)/Y))[ind_h_diag],
+       #       ((abs(Y - hat_reverse_yearly)/Y))[ind_h_diag],
+       #        ((abs(Y - mig_rate_yearly)/Y))[ind_h_diag],
+       #         ((abs(Y - hat_min_closed_yearly)/Y))[ind_h_diag],
+       #         ((abs(Y - hat_pb_yearly)/Y))[ind_h_diag] 
+              )
+      
+    MAE <- c(((abs(Y - hat_drop)))[ind_h_diag],
+               ((abs(Y - hat_reverse)))[ind_h_diag],
+               ((abs(Y - hat_transport)))[ind_h_diag],
+               ((abs(Y - mig_rate)))[ind_h_diag],
+               ((abs(Y - hat_min_closed)))[ind_h_diag],
+               ((abs(Y - hat_pb)))[ind_h_diag]
+             #((abs(Y - hat_drop_yearly)))[ind_h_diag],
+             #   ((abs(Y - hat_reverse_yearly)))[ind_h_diag],
+             #  ((abs(Y - mig_rate_yearly)))[ind_h_diag],
+             #   ((abs(Y - hat_min_closed_yearly)))[ind_h_diag],
+             #  ((abs(Y - hat_pb_yearly)))[ind_h_diag]
+             )
+      
+    MSE <- c((((Y - hat_drop)^2))[ind_h_diag],
+               (((Y - hat_reverse)^2))[ind_h_diag],
+               (((Y - hat_transport)^2))[ind_h_diag],
+               (((Y - mig_rate)^2))[ind_h_diag],
+               (((Y - hat_min_closed)^2))[ind_h_diag],
+               (((Y - hat_pb)^2))[ind_h_diag]
+             #(((Y - hat_drop_yearly)^2))[ind_h_diag],
+             #   (((Y - hat_reverse)^2))[ind_h_diag],
+             #  (((Y - mig_rate_yearly)^2))[ind_h_diag],
+             #   (((Y - hat_min_closed_yearly)^2))[ind_h_diag],
+             #   (((Y - hat_pb_yearly)^2))[ind_h_diag]
+             )
+ 
+    RMSE <- c((((Y - hat_drop)^2)/Y)[ind_h_diag],
+               (((Y - hat_reverse)^2)/Y)[ind_h_diag],
+               (((Y - hat_transport)^2)/Y)[ind_h_diag],
+               (((Y - mig_rate)^2)/Y)[ind_h_diag],
+               (((Y - hat_min_closed)^2)/Y)[ind_h_diag],
+               (((Y - hat_pb)^2)/Y)[ind_h_diag]
+           #  (((Y - hat_drop_yearly)^2)/Y)[ind_h_diag],
+          #     (((Y - hat_reverse_yearly)^2)/Y)[ind_h_diag],
+           #    (((Y - mig_rate_yearly)^2)/Y)[ind_h_diag],
+          #   (((Y - hat_min_closed_yearly)^2)/Y)[ind_h_diag],
+           #    (((Y - hat_pb_yearly)^2)/Y)[ind_h_diag]
+              )   
+      
+    estimation <- c(hat_drop[ind_h_diag], hat_reverse[ind_h_diag],
+                      hat_transport[ind_h_diag], mig_rate[ind_h_diag], 
+                      hat_min_closed[ind_h_diag], hat_pb[ind_h_diag]
+                  #  hat_drop_yearly[ind_h_diag], hat_reverse_yearly[ind_h_diag],
+                  #    mig_rate_yearly[ind_h_diag], hat_min_closed_yearly[ind_h_diag],
+                  #  hat_pb_yearly[ind_h_diag]
+                    )
+      
+    sign_estimation <- c(((Y - hat_drop) > 0)[ind_h_diag],
+                      ((Y - hat_reverse) > 0)[ind_h_diag],
+                      ((Y - hat_transport) > 0)[ind_h_diag],
+                      ((Y - mig_rate) > 0)[ind_h_diag],
+                      ((Y - hat_min_closed) > 0)[ind_h_diag],
+                      ((Y - hat_pb) > 0)[ind_h_diag]
+                  #    ((Y - hat_drop_yearly) > 0)[ind_h_diag],
+                  #    ((Y - hat_reverse_yearly) > 0)[ind_h_diag],
+                  #    ((Y - mig_rate_yearly) > 0)[ind_h_diag],
+                  #    ((Y - hat_min_closed_yearly) > 0)[ind_h_diag],
+                  #    ((Y - hat_pb_yearly) > 0)[ind_h_diag]
+                      )
+      
+    compare_method <- cbind(((abs(Y - hat_drop)))[ind_h_diag],
+                          ((abs(Y - hat_reverse)))[ind_h_diag],
+                          ((abs(Y - hat_transport)))[ind_h_diag],
+                          ((abs(Y - mig_rate)))[ind_h_diag],
+                          ((abs(Y - hat_min_closed)))[ind_h_diag],
+                          ((abs(Y - hat_pb)))[ind_h_diag]
+                     #     ((abs(Y - hat_drop_yearly)))[ind_h_diag],
+                    #      ((abs(Y - hat_reverse_yearly)))[ind_h_diag],
+                    #      ((abs(Y - mig_rate_yearly)))[ind_h_diag],
+                    #      ((abs(Y - hat_min_closed_yearly)))[ind_h_diag],
+                    #      ((abs(Y - hat_pb_yearly)))[ind_h_diag]
+                          )
+    best_pred[increment_best] <- apply(compare_method, 1, which.min)
+    
+    mae_tab[b, ] <- colMeans(compare_method)  
+    
+    # mape
+    compare_method_2 <- cbind(((abs(Y - hat_drop) / Y))[ind_h_diag],
+                            ((abs(Y - hat_reverse) / Y))[ind_h_diag],
+                            ((abs(Y - hat_transport) / Y))[ind_h_diag],
+                            ((abs(Y - mig_rate) / Y))[ind_h_diag],
+                            ((abs(Y - hat_min_closed) / Y))[ind_h_diag],
+                            ((abs(Y - hat_pb) / Y))[ind_h_diag]
+                           # ((abs(Y - hat_drop_yearly) / Y))[ind_h_diag],
+                          #  ((abs(Y - hat_reverse_yearly) / Y))[ind_h_diag],
+                          #  ((abs(Y - mig_rate_yearly) / Y))[ind_h_diag],
+                          #  ((abs(Y - hat_min_closed_yearly) / Y))[ind_h_diag],
+                          #  ((abs(Y - hat_pb_yearly) / Y))[ind_h_diag]
+                            )
+    mape_tab[b, ] <- colMeans(compare_method_2)  
+
+    # mse
+    compare_method_3 <- cbind((((Y - hat_drop)^2))[ind_h_diag],
+                              (((Y - hat_reverse)^2))[ind_h_diag],
+                              (((Y - hat_transport)^2))[ind_h_diag],
+                              (((Y - mig_rate)^2))[ind_h_diag],
+                              (((Y - hat_min_closed)^2))[ind_h_diag],
+                              (((Y - hat_pb)^2))[ind_h_diag]
+                            #  (((Y - hat_drop_yearly)^2))[ind_h_diag],
+                            #  (((Y - hat_reverse_yearly)^2))[ind_h_diag],
+                            #  (((Y - mig_rate_yearly)^2))[ind_h_diag],
+                            #  (((Y - hat_min_closed_yearly)^2))[ind_h_diag],
+                            #  (((Y - hat_pb_yearly)^2))[ind_h_diag]
+                              )
+    rmse_tab[b, ] <- sqrt(colMeans(compare_method_3))  
+    
+    res[increment, ] <- data.frame(Method = rep(names_method_esti, each = n * (n - 1)),
+                                     outwards = mat_outwards[ind_h_diag],
+                                     returns = mat_returns[ind_h_diag],
+                                     transit = mat_transit[ind_h_diag],
+                                     MAE = MAE,
+                                     estimation = estimation,
+                                     sign_estimation = c("Over-", "Under-")[sign_estimation + 1],
+                                     Y = Y[ind_h_diag],
+                                     RMAE = RMAE,
+                                     MSE = MSE, 
+                                     RMSE = RMSE)
+    increment <- increment + nb_method_esti * n * (n-1)
+    increment_best <- increment_best + n * (n-1)
+}
+)
+# scenario
+res$scenario <- ""
+res$scenario[res$outwards > res$returns & res$outwards >  res$transit ] <- "Outwards >> Returns, Transit" 
+res$scenario[res$returns > res$outwards & res$returns > res$transit ] <- "Returns >> Outwards, Transit" 
+res$scenario[res$transit > res$outwards & res$transit > res$returns ] <- "Transit >> Outwards, Returns" 
+
+# proportion of sign 
+res$sign_estimation <- substr(res$sign_estimation, 1, 
+                              nchar(res$sign_estimation) - 1)
+mape_tab <- as.data.frame(mape_tab)
+colnames(mape_tab) <- names_method_esti
+
+mae_tab <- as.data.frame(mae_tab)
+colnames(mae_tab) <- names_method_esti
+
+rmse_tab <- as.data.frame(rmse_tab)
+colnames(rmse_tab) <- names_method_esti
+
+# save 
+save(res, my_M, best_pred, mape_tab, mae_tab, rmse_tab, 
+     file = "results/res_simu.RData")
+# save(res, my_M, best_pred, mape_tab, mae_tab, rmse_tab, 
+#     file = "results/res_simu_yearly.RData")
+```
+
+## Results 
+
+We represent the parallel boxplots of the three evaluation metrics—MAE, MAPE, and RMSE—across the different methods, based on the 100 simulation replications (figure 2 in the article) :
+
+```{r, fig.width = 8, fig.height = 3.5}
+load(file = "results/res_simu.RData")
+res_tab <- rbind(mape_tab, mae_tab, rmse_tab) %>%
+  pivot_longer(cols = 1:nb_method_esti, names_to = "Method", values_to = "Values") %>%
+  mutate(Metric = rep(c("MAPE", "MAE", "RMSE"), each = nb_rep * nb_method_esti))
+res_tab$Method[res_tab$Method == "mini."] <- "IPFP"
+res_tab$Method <- factor(res_tab$Method, 
+            levels = c("drop", "reverse", "mig. rate", "IPFP", "PB", "OT"))  
+ggplot(res_tab, aes(x = Method, y = Values)) +
+  geom_boxplot() +
+  theme(axis.text.x=element_text(angle = 90)) +
+  facet_wrap(~Metric, scales = "free_y", ncol = 3)
+ggsave("figures/res_simu.pdf", width = 8, height = 3.5)
+```
+
+We compute the average values of the evaluation indicators—BPR, UND, MAE, MAPE, and RMSE—computed across the $B$ simulation replications. Values highlighted in red represent the best performance for each metric, while those in orange indicate the second-best performance (Table 1 in the article):
+
+```{r}
+res$Method[res$Method == "minimization"] <- "IPFP"
+res$Method[res$Method == "migr. rate"] <- "mig. rate"
+res$Method <- factor(res$Method, 
+            levels = c("drop", "reverse", "mig. rate", "IPFP", "PB", "OT"))
+res_tab <- res %>% 
+  group_by(Method) %>%
+  summarise(
+    UND = round(mean(estimation < Y) * 100, 2),
+    MAE = mean(MAE),
+    MAPE = round(100 * mean(RMAE), 2), 
+    RMSE = sqrt(mean(MSE)))
+
+res_tab <- merge(
+    data.frame(BPR = round(100 * as.numeric(table(best_pred)) /
+                             sum(as.numeric(table(best_pred))), 2),
+      Method = names_method_esti),
+    res_tab,
+    by = "Method")
+row.names(res_tab) <- res_tab$Method
+t(round(res_tab[c("drop", "reverse", "mig. rate", "IPFP", "PB", "OT"), -1], 2))
+```
+
+We represent the scatter plots of the estimated flows $\hat{F}_{ij}$ versus the observed flows $F_{ij}$ for each method (drop negative, migration rate, minimization, Optimal Transport, Pseudo-Bayes, and reverse negative). The lower panel zooms in on the smallest flows (figure 10 in the article)
+
+```{r, fig.width = 12, fig.height = 7, warning = F}
+set.seed(1)
+choose_ind <- sample(1:100, size = 5)
+temp <- sapply(choose_ind, function(x) ((x - 1) * ( n * (n - 1) * 6) + 1):(x * (6 * n * (n - 1)) ))
+res_1_simu <- res[temp, ]
+
+p <- ggplot(res_1_simu, aes(x = Y, y = estimation, color = sign_estimation)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(color = "Over/Under estimate") +
+  facet_wrap(~Method)
+p
+#ggsave("figures/scatterplot.jpeg", width = 12, height = 7, plot = p)
+```
+
+
+```{r, fig.width = 12, fig.height = 7, warning = F}
+p <- ggplot(res_1_simu, aes(x = Y, y = estimation, color = sign_estimation)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(color = "Over/Under estimate") +
+  facet_wrap(~Method) + 
+  xlim(0, 300000) + 
+  ylim(0, 300000)
+#ggsave("figures/scatterplot_2.jpeg", width = 12, height = 7, plot = p)
+```
+
+We represent the boxplots of the absolute relative error, $\frac{|F_{ij} - \hat{F}^{(m)}_{ij}|}{F_{ij}}$, computed over five simulations, stratified by the dominant component of each true flow: Outwards, Returns, or Transits (figure 11 in the article)
+
+```{r, fig.width = 12, fig.height = 5, warning = F}
+res_1_simu %>%
+  ggplot() + 
+  aes(x = Method, y = RMAE) +
+  geom_boxplot() +
+  ylim(0, 2) +
+  ylab(latex2exp::TeX(r'($(|F_{ij}-\hat{F}_{ij}|)/F_{ij}$)')) +
+  theme(axis.text.x=element_text(angle = 90)) +
+  facet_wrap(~scenario) 
+# ggsave("figures/boxplot_2.jpeg", width = 12, height = 5)
+```
+
+
+# Estimation procedure
+
+The final dataset includes:
+
+* `origin` and `dest` (origin and destination countries),
+* `period` (five-year period),
+* `type` (sex disaggregation).
+
+Migration estimates are computed using UN stock data under different adjustment schemes:
+
+Using Raw data:
+
+* `hat_drop`: drop negative from raw data,
+* `hat_reverse`: reverse negative from raw data,
+* `hat_mig_rate`: migration rate from raw data, 
+
+Using Open Adjusted data: 
+
+* `hat_drop_open`: drop negative on open adjusted data,
+* `hat_reverse_open`: reverse negative on open adjusted data,
+* `hat_mig_rate_open`: migration rate on open adjusted data,
+* `hat_min_open`: minimization method on open adjusted data, 
+
+Using Closed Adjusted data: 
+* `hat_drop_closed`: drop negative on closed adjusted data,
+* `hat_reverse_closed`: reverse negative on closed adjusted data,
+* `hat_mig_rate_closed`: migration rate on closed adjusted data,
+* `hat_min_closed`: minimization method on closed adjusted data,
+* `hat_pb`: pseudo-Bayes method on closed adjusted data. 
+
+```{r}
+our_estimates_1y <- data.frame(
+  origin = character(0),
+  dest = character(0),
+  year = character(0),
+  type = character(0),
+  # Open
+  OT_open = numeric(0),
+  OT_open_outwards = numeric(0),
+  OT_open_returns = numeric(0),
+  OT_open_transits = numeric(0),
+  # closed 
+  OT_closed = numeric(0),
+  OT_closed_outwards = numeric(0),
+  OT_closed_returns = numeric(0),
+  OT_closed_transits = numeric(0)
+)
+
+our_estimates_5y <- data.frame(
+  origin = character(0),
+  dest = character(0),
+  year = character(0),
+  type = character(0),
+  # Open
+  hat_transport_open_outwards = numeric(0),
+  hat_transport_open_returns = numeric(0),
+  hat_transport_open_transits = numeric(0),
+  # closed 
+  hat_transport_closed_outwards = numeric(0),
+  hat_transport_closed_returns = numeric(0),
+  hat_transport_closed_transits = numeric(0)
+)
+
+all_estimates <- data.frame(
+  origin = character(0),
+  dest = character(0),
+  year = character(0),
+  type = character(0),
+  # No adjustment
+  hat_drop = numeric(0),
+  hat_reverse = numeric(0),
+  hat_mig_rate = numeric(0),
+  # Open
+  hat_drop_open = numeric(0),
+  hat_reverse_open = numeric(0),
+  hat_mig_rate_open = numeric(0),
+  hat_min_open = numeric(0),
+  hat_transport_open = numeric(0),
+  # closed 
+  hat_drop_closed = numeric(0),
+  hat_reverse_closed = numeric(0),
+  hat_mig_rate_closed = numeric(0),
+  hat_min_closed = numeric(0),
+  hat_pb = numeric(0),
+  hat_transport_closed = numeric(0)
+)
+```
+
+
+```{r, eval = F}
+years <- c(seq(1990, 2020, by = 5), 2024)
+n <- 230
+ptm <- proc.time()
+for (k in 1:(length(years) - 1)) {
+   my_period <- paste0(years[k], "-", years[k + 1])
+   cat("Period: ", my_period, "\n")
+   for (l in c("tot", "m", "f")) {
+     cat("  Sex: ", l, "\n")
+    # import stock table
+     load(file = paste0("results/stock_", l, "_", years[k], ".RData"))
+            
+     # Estimates 
+     # 1/ Tables without adjustment : drop, reverse and migration rate
+     ## drop and reverse
+     hat_drop <- my_diff(s1, s2, type = "drop")
+     hat_reverse <- my_diff(s1, s2, type = "reverse")
+     ## migration rate
+     # compute the total number M of migrant
+     # it is first adjusted such that the sum of the elements of the vector equals 0 (rescale_net function)
+     M <- sum(abs(migest::rescale_net(demo[demo$period == my_period, 
+                                           paste0(l, "_", "net")])))
+     hat_mig_rate <- round(M * s1 / (sum(s1) - sum(diag(s1))))
+     diag(hat_mig_rate) <- 0
+
+   
+     # 2/ Tables with open adjusted data
+     hat_drop_open <- my_diff(s1_open, s2_open, type = "drop") 
+     hat_reverse_open <- my_diff(s1_open, s2_open, type = "reverse")
+     hat_mig_rate_open <- round(M * s1_open / (sum(s1_open) - sum(diag(s1_open))))
+     diag(hat_mig_rate_open) <- 0
+     hat_min_open <- my_min(s1_open, s2_open)
+     
+     # 3/ Tables with closed adjusted data
+     hat_drop_closed <- my_diff(s1_closed, s2_closed, type = "drop") 
+     hat_reverse_closed <- my_diff(s1_closed, s2_closed, type = "reverse")   
+     hat_mig_rate_closed <- round(M * s1_closed / (sum(s1_closed) - sum(diag(s1_closed))))
+     diag(hat_mig_rate_closed) <- 0
+     hat_min_closed <- my_min(s1_closed, s2_closed)
+     hat_pb <- 0.87 * hat_min_closed + (1 - 0.87) * bayes(s1_closed, s2_closed)
+     diag(hat_pb) <- 0
+     
+     ##################
+     ### Methodology for OT 
+     ####. closed and OPEN at the same time  
+     s_year_0_closed <- s1_closed
+     hat_transport_closed <- outwards_closed <- returns_closed <- transit_closed <- numeric(n^2)
+     s_year_0_open <- s1_open
+     hat_transport_open <- outwards_open <- returns_open <- transit_open <- numeric(n^2)
+     
+     for(t_0 in 1:5) {
+       if(years[k] == 2020 & t_0 == 5)
+         break
+      
+      ##############  
+      # closed 
+      s_year_1_closed = s1_closed + t_0 * (s2_closed - s1_closed) / 
+        ifelse(years[k] != 2020, 5, 4)
+      new_data <- data.frame(
+          stock_0 = as.vector(s_year_0_closed), 
+          stock_1 = as.vector(s_year_1_closed),
+          birth = rep(row.names(s_year_0_closed), n),
+          residence = rep(row.names(s_year_0_closed), each = n))
+      hat_outflows <- predict(nls_outflows[["closed"]], newdata = new_data)
+      hat_inflows <- predict(nls_inflows[["closed"]], newdata = new_data)
+      
+      temp_time_closed <- my_transport(new_data$stock_0, new_data$stock_1, 
+                                new_data$birth, new_data$residence, 
+                                hat_outflows, hat_inflows, 
+                                rate_returns = 0.6424708)
+
+
+      hat_transport_closed <- hat_transport_closed + as.vector(temp_time_closed$res)
+      outwards_closed <- outwards_closed + as.vector(temp_time_closed$outwards) 
+      returns_closed <- returns_closed + as.vector(temp_time_closed$returns) 
+      transit_closed <- transit_closed + as.vector(temp_time_closed$transit) 
+      
+      ############
+      # open
+      s_year_1_open = s1_open + t_0 * (s2_open - s1_open) / 
+        ifelse(years[k] != 2020, 5, 4)
+      new_data <- data.frame(
+          stock_0 = as.vector(s_year_0_open), 
+          stock_1 = as.vector(s_year_1_open),
+          birth = rep(row.names(s_year_0_open), n),
+          residence = rep(row.names(s_year_0_open), each = n))
+
+      hat_outflows <- predict(nls_outflows[["open"]], newdata = new_data)
+      hat_inflows <- predict(nls_inflows[["open"]], newdata = new_data)
+      
+      temp_time_open <- my_transport(new_data$stock_0, new_data$stock_1, 
+                                new_data$birth, new_data$residence, 
+                                hat_outflows, hat_inflows, 
+                                rate_returns = 0.6757961)
+   
+      hat_transport_open <- hat_transport_open + as.vector(temp_time_open$res)
+      outwards_open <- outwards_open + as.vector(temp_time_open$outwards) 
+      returns_open <- returns_open + as.vector(temp_time_open$returns) 
+      transit_open <- transit_open + as.vector(temp_time_open$transit) 
+      
+      our_estimates_1y <- rbind(our_estimates_1y, data.frame(
+        origin = rep(country$iso, n),
+        dest = rep(country$iso, each = n),
+        year = years[k] + t_0,    
+        type = rep(l, n * n),
+        # Open
+        OT_open = as.vector(temp_time_open$res),
+        OT_open_outwards = as.vector(temp_time_open$outwards),
+        OT_open_returns = as.vector(temp_time_open$returns),
+        OT_open_transits = as.vector(temp_time_open$transit),
+        # closed
+        OT_closed = as.vector(temp_time_closed$res),
+        OT_closed_outwards = as.vector(temp_time_closed$outwards),
+        OT_closed_returns = as.vector(temp_time_closed$returns),
+        OT_closed_transits = as.vector(temp_time_closed$transit)
+       )
+      )
+      # re-initialisation
+      s_year_0_closed <- s_year_1_closed
+      s_year_0_open <- s_year_1_open
+     }
+       
+     #######
+     
+     all_estimates <- rbind(all_estimates, data.frame(
+       origin = rep(country$iso, n),
+       dest = rep(country$iso, each = n),
+       year = paste0(years[k], "-", years[k + 1]),    
+       type = rep(l, n * n),
+       # No adjustment
+       hat_drop = as.vector(hat_drop),
+       hat_reverse = as.vector(hat_reverse),
+       hat_mig_rate = as.vector(hat_mig_rate),
+#       hat_transport = as.vector(hat_transport),
+       # Open
+       hat_drop_open = as.vector(hat_drop_open),
+       hat_reverse_open = as.vector(hat_reverse_open),
+       hat_mig_rate_open = as.vector(hat_mig_rate_open),
+       hat_min_open = as.vector(hat_min_open),
+       hat_transport_open = as.vector(hat_transport_open),
+       # closed 
+       hat_drop_closed = as.vector(hat_drop_closed),
+       hat_reverse_closed = as.vector(hat_reverse_closed),
+       hat_mig_rate_closed = as.vector(hat_mig_rate_closed),
+       hat_min_closed = as.vector(hat_min_closed),
+       hat_transport_closed = as.vector(hat_transport_closed),
+       hat_pb = as.vector(hat_pb)
+       ))
+     
+     our_estimates_5y <- rbind(our_estimates_5y, data.frame(
+       origin = rep(country$iso, n),
+       dest = rep(country$iso, each = n),
+       year = paste0(years[k], "-", years[k + 1]),    
+       type = rep(l, n * n),
+       # Open
+       hat_transport_open_outwards = as.vector(outwards_open),
+       hat_transport_open_returns = as.vector(returns_open),
+       hat_transport_open_transits = as.vector(transit_open),
+       # closed 
+       hat_transport_closed_outwards = as.vector(outwards_closed),
+       hat_transport_closed_returns = as.vector(returns_closed),
+       hat_transport_closed_transits = as.vector(transit_closed)
+      )
+     )
+
+   }
+}
+```
+
+```{r, echo = F, eval = F}
+ save(our_estimates_1y, our_estimates_5y, all_estimates, file = "results/our_estimates_2024.RData")
+```
+
+```{r, echo = F, eval = T}
+ load(file = "results/our_estimates_2024.RData")
+our_estimates <- our_estimates_5y %>% 
+  filter(origin != dest)
+all_estimates <- all_estimates %>% 
+  filter(origin != dest)
+```
+ 
+## Comparison of estimation methods and data consistency 
+
+Here, we aim to assess whether our results align with those published by Abel and Cohen. For this comparison, we use the version of their dataset dated 2025-03-26, 06:16, available at: https://figshare.com/articles/dataset/Bilateral_international_migration_flow_estimates_for_200_countries_1990-1995_to_2010-2015_/7731233?file=53235671.
+
+```{r}
+abel <- read.csv("data/bilat_mig.csv")
+abel$year0 <- paste0(abel$year0, "-", abel$year0 + 5)
+abel_long <- pivot_longer(abel, cols = 4:9, names_to = "method", values_to = "abel_estimate")
+our_estimates_long <- all_estimates %>%
+  filter(type == "tot") %>%
+  dplyr::select(origin, dest, year, hat_drop, hat_reverse, hat_mig_rate,
+         hat_min_open, hat_min_closed, hat_pb) %>%
+  rename(sd_drop_neg = 4, sd_rev_neg = 5, mig_rate = 6, da_min_open = 7, 
+         da_min_closed = 8, da_pb_closed = 9) %>% 
+  pivot_longer(cols = 4:9, names_to = "method", values_to = "our_estimate")
+# merge the two data bases
+our_estimates_long <- merge(our_estimates_long, abel_long, by.x = c("origin", "dest", "year", "method"), 
+                      by.y = c("orig", "dest", "year0", "method"))
+```
+
+We plot the correlation between our estimate and abel's (Figure 12 in the article):
+
+```{r, fig.width = 12, fig.height = 6}
+our_estimates_long$method[our_estimates_long$method == "da_min_closed"] <- "IPFP (closed)"
+our_estimates_long$method[our_estimates_long$method == "da_min_open"] <- "IPFP (open)"
+our_estimates_long$method[our_estimates_long$method == "da_pb_closed"] <- "PB"
+our_estimates_long$method[our_estimates_long$method == "mig_rate"] <- "mig. rate"
+our_estimates_long$method[our_estimates_long$method == "sd_drop_neg"] <- "drop"
+our_estimates_long$method[our_estimates_long$method == "sd_rev_neg"] <- "reverse"
+our_estimates_long$method <- factor(our_estimates_long$method,
+        levels = c("drop", "reverse", "mig. rate", "IPFP (open)", "IPFP (closed)", "PB"))
+our_estimates_long %>%
+  ggplot() +
+  aes(x = abel_estimate, y = our_estimate) +
+  geom_point() + 
+  xlab("Estimates produced by Guy J. Abel") +
+  ylab("Estimates produced by the Authors") +
+  geom_abline(slope = 1, intercept = 0) + 
+  facet_wrap(~ method)
+ggsave("figures/abel_estimates.jpeg", width = 8, height = 4)
+```
+
+We compute the mean/median of the absolute differences :
+```{r}
+our_estimates_long %>%
+  mutate(diff = abs(abel_estimate - our_estimate)) %>%
+  group_by(method) %>%
+  summarise(diff_mean = mean(diff),
+            diff_med = median(diff)) %>%
+  arrange(-diff_mean)
+```
+
+We observe differences between the two versions, which can be attributed to database updates and the increased significance of the "unknown" category in the latest data version. Moreover, the closed demographic adjustment and Pseudo-Bayes estimates show the greatest divergence from our results.
+
+
+
+**Note : ** Some of these differences may appear significant, particularly the flow from Germany to the United States between 1990 and 1995. This flow was very small in the previous version of Abel and Cohen, but is notably larger in the current version. This is due to the high stock of Germans in the U.S. in 1995 (2,261,086), which is much higher compared to 1990 (1,465,599) and 2000 (1,369,572). The other flows that differ correspond to denser migration corridors (from countries like India or China or Mexico to the USA), for which it can be assumed that adjustments were made based on updated population censuses.
+
+
+We plot the total Migration Flows (in millions) and Crude Migration Rates (migrants per thousand people in the population) (Figure 3 in the article) : 
+
+```{r}
+wpp2024_pop <- wpp2024 %>% filter(`Region, subregion, country or area *` == "World") %>% 
+  select(11, 13) %>% 
+  filter(Year %in% c(1990, 1995, 2000, 2005, 2010, 2015, 2020)) %>% 
+  mutate(Period = paste0(Year, "-", Year + ifelse(Year == 2020, 4, 5))) %>%
+  rename(Pop = 2) %>%
+  mutate(Pop = as.numeric(Pop))
+
+our_estimates_long <- all_estimates %>%
+  filter(type == "tot") %>%
+  pivot_longer(cols = 5:18, names_to = "Method", values_to = "Flows")
+temp_long <- our_estimates_long %>%
+  group_by(year, Method) %>%
+  summarise(Flows = sum(Flows)) %>%
+  mutate(Period = factor(year),
+         Method = substr(Method, 5, nchar(Method))) %>%
+  mutate(Method = gsub(pattern = "mig_", replacement = "mig. ", Method),
+         Method = gsub(pattern = "pb", replacement = "PB_closed", Method),
+         Method = gsub(pattern = "transport", replacement = "OT", Method)) %>% 
+  separate(col = Method, into = c("Method", "stock"), sep = "_") %>% 
+  mutate(stock = ifelse(is.na(stock), "raw", stock)) 
+temp_long$type <- "Sum of flows \n (in Millions)"
+temp_long_2 <- merge(temp_long, wpp2024_pop, by = "Period")
+temp_long_2$Flows <- temp_long_2$Flows / temp_long_2$Pop 
+temp_long_2$type <- "Crude Migration Rate \n (per thousand population)"
+temp_long$Flows <- temp_long$Flows / 10^6 
+temp_long <- rbind(temp_long, temp_long_2)
+temp_long$type <- factor(temp_long$type, 
+            levels = c("Sum of flows \n (in Millions)", 
+                       "Crude Migration Rate \n (per thousand population)"))
+
+temp_long$Method[temp_long$Method == "min"] <- "IPFP"
+temp_long$Method <- factor(temp_long$Method, 
+    levels = c("drop", "reverse", "mig. rate", "IPFP", "PB", "OT"))
+ggplot(temp_long, aes(x = Period, y = Flows, color = Method, group = Method)) +
+  geom_line() +
+  theme(axis.text.x=element_text(angle = 90)) +
+ # scale_y_continuous(labels = scales::unit_format(unit = "M", scale = 1e-6)) +
+  facet_grid(type ~ stock, scales = "free_y")
+ggsave("figures/total_flows.pdf", width = 8, height = 5.5)
+```
+
+
+We represent the Summary statistics of the estimates (Table 2 in the article):
+
+```{r}
+stargazer::stargazer(all_estimates[all_estimates$type == "tot",], 
+                     type = "latex",  median = TRUE, 
+                     align = T, header = F, digits = 0,
+          title = " Summary statistics of the samples")
+# proportion zero
+temp_summary <- all_estimates[all_estimates$type == "tot",]
+sapply(temp_summary, function(x) round(100 * length(which(x == 0)) / length(x), 2))
+```
+
+
+We plot figure 13 :
+
+```{r}
+# shares by year 
+shares <- aggregate(our_estimates[our_estimates$type == "tot", -c(1, 2, 3, 4)],
+                    by = list(year = our_estimates$year[our_estimates$type == "tot"]),
+                    FUN = sum) 
+shares[, c(2, 3, 4)] <- shares[, c(2, 3, 4)] / rowSums(shares[, c(2, 3, 4)]) 
+shares[, c(5, 6, 7)] <- shares[, c(5, 6, 7)] / rowSums(shares[, c(5, 6, 7)]) 
+
+shares_pivot <- shares %>% 
+  pivot_longer(cols = -1, names_to = "compo",
+                             values_to = "share") %>%
+  separate(col = compo, into = c("hat", "transport", "Method", "compo"), sep = "_") %>% 
+  select(-hat, -transport)
+
+shares_pivot$year <- factor(shares_pivot$year)
+
+ggplot(shares_pivot, aes(x = year, y = share, color = compo, group = compo)) +
+  geom_line() +
+  facet_wrap(~ Method) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  ylab("Percentage of Total Flows")
+ggsave("figures/compo.pdf", width = 8, height = 3.5)
+
+# global shares  
+shares_tot <- aggregate(our_estimates[our_estimates$type == "tot", -c(1, 2, 3, 4)],
+                    by = list(year = our_estimates$type[our_estimates$type == "tot"]),
+                    FUN = sum) 
+shares_tot[, c(2, 3, 4)] <- shares_tot[, c(2, 3, 4)] / rowSums(shares_tot[, c(2, 3, 4)]) 
+shares_tot[, c(5, 6, 7)] <- shares_tot[, c(5, 6, 7)] / rowSums(shares_tot[, c(5, 6, 7)]) 
+
+```
+
+
+We give the highest flows for returns and for the transits:
+```{r}
+our_estimates %>%
+  filter(type == "tot", year == "2020-2024") %>%
+  arrange(-hat_transport_open_returns) %>%
+  head(3)
+our_estimates %>%
+  filter(type == "tot", year == "2020-2024") %>%
+  arrange(-hat_transport_closed_returns) %>%
+  head(3)
+our_estimates %>%
+  filter(type == "tot", year == "2020-2024") %>%
+  arrange(-hat_transport_open_transits) %>%
+  head(3)
+our_estimates %>%
+  filter(type == "tot", year == "2020-2024") %>%
+  arrange(-hat_transport_closed_transits) %>%
+  head(3)
+```
+
+
+We plot the boxplot of the various migration flow estimates (log scale), grouped by type of stock table used (raw, open, closed) (figure 14 in the article):
+
+```{r, eval = F}
+our_estimates_long %>%
+  mutate(Method = substr(Method, 5, nchar(Method))) %>%
+  mutate(Method = gsub(pattern = "mig_", replacement = "mig. ", Method),
+         Method = gsub(pattern = "pb", replacement = "PB_closed", Method),
+         Method = gsub(pattern = "min", replacement = "IPFP", Method),
+         Method = gsub(pattern = "transport", replacement = "OT", Method)) %>% 
+  separate(col = Method, into = c("Method", "stock"), sep = "_") %>% 
+  mutate(stock = ifelse(is.na(stock), "raw", stock)) %>%  
+  mutate(stock = factor(stock, levels = c("raw", "open", "closed")),
+         Method = factor(Method, 
+             levels = c("drop", "reverse", "mig. rate", "IPFP", "PB", "OT"))) %>%
+  ggplot(aes(x = Method, y = 1 + Flows)) +
+  geom_boxplot() +
+  ylab("Estimated Flows (in log scale)") +
+  xlab("Method") + 
+  scale_y_log10() +
+  theme_minimal() +
+  theme(axis.text.x=element_text(angle = 90))  +
+  theme(aspect.ratio = 1) +
+  facet_grid( ~ stock, scales = "free")
+ggsave("figures/box_estimates.jpeg", width = 8, height = 3.5)
+```
+
+
+
+### Collection of Migration Statistics
+
+In this subsection, we compile migration data from various publicly available sources in order to compare our estimation results with existing datasets. This corresponds to Section 6.3 of the article.
+
+* DEMIG C2C data (Source: https://www.migrationinstitute.org/publications/wp-88-14) 
+
+```{r, warning = F, message = F}
+names_est <- c("hat_drop", "hat_reverse", "hat_mig_rate",
+               "hat_drop_open", "hat_reverse_open", "hat_mig_rate_open", "hat_min_open", 
+               "hat_transport_open", 
+               "hat_drop_closed", "hat_reverse_closed", "hat_mig_rate_closed", "hat_min_closed",
+               "hat_transport_closed", "hat_pb", "Y") 
+# to keep the same evaluation points than ABel and Cohen
+country_validation <- read.csv("data/country_period_validation.csv")
+# the data
+my_path <- "data/demig-c2c-migration-flow-database-version-1-2_limited-online-edition.xlsx"
+# the population data
+temp_pop <- demo %>%
+    mutate(iso3 = countrycode::countrycode(Location, 
+                      origin = "country.name", "iso3c")) %>%
+    select(iso3, period, tot_pop_t0) %>%
+    rename(pop = 3)  
+
+# Demig C2C
+countries_of_interset_demig <- c("AUT", "BEL", "CZE", "DNK", "FIN", "DEU",
+        "ISL", "NZL", "POL", "SVN", "ESP", "SWE", "SVK", "ZAF", "GBR")
+
+#####
+#### Outflows
+
+demig_outflow_read <- readxl::read_xlsx(path = my_path, sheet = 3) 
+demig_outflow <- demig_outflow_read %>% 
+   filter(Criterion == "COR",
+          Year %in% (1990:2024),
+          Gender == "Total")  %>% 
+  filter(`Coverage -Citizens/Foreigners/Both-` == "Both") %>%
+  mutate(weight = ifelse(Year %in% c(1990, 1995, 2000, 2005, 2010, 2015), 0.5, 1))
+ 
+# aggregate by period of five years
+demig_outflow_agg <- data.frame(origin = character(), dest = character(),
+                                period = character(), Y = numeric())  
+for(p in 1990:2015) {
+
+  demig_outflow_agg <-  rbind(demig_outflow_agg,
+    demig_outflow %>%
+      filter(Year %in% p:(p+5)) %>% 
+      group_by(`Reporting country`, `Country codes -UN based-`)   %>%
+      summarise(Y = sum(Value * weight),
+                weight = sum(weight)) %>%
+      mutate(Y = 5 * Y / weight, 
+             period = paste0(p, "-", p+5)) %>%
+      rename(origin = 1, dest = 2)
+  )
+}
+    
+demig_outflow_agg$origin <- countrycode(demig_outflow_agg$origin, 
+                                        "country.name", "iso3c")  
+
+demig_outflow_agg <- demig_outflow_agg %>%
+  filter(!is.na(dest)) %>%
+  filter(!is.na(origin)) %>%
+  filter(!is.na(Y)) %>%
+  select(-weight)
+
+# merge with the estimates
+demig_outflow_agg <- merge(all_estimates[all_estimates$type == "tot", ], 
+                 demig_outflow_agg[, c("origin", "dest", "period", "Y")], 
+                 by.x = c("origin", "dest", "year"),
+                 by.y = c("origin", "dest", "period"))
+
+# compute total outflows
+demig_outflow_agg_prop <- demig_outflow_agg %>%
+   group_by(origin, year) %>%
+   summarise(across(where(is.numeric), sum, na.rm = TRUE))
+colnames(demig_outflow_agg_prop)[-c(1, 2)] <- 
+  paste0(colnames(demig_outflow_agg_prop[, -c(1, 2)]), "_tot")
+# we avoid to divide by 0
+demig_outflow_agg_prop[demig_outflow_agg_prop == 0] <- 1
+
+demig_outflow_agg <- merge(demig_outflow_agg, demig_outflow_agg_prop, 
+                          by = c("origin", "year"))
+demig_outflow_agg[, paste0(names_est, "_tot")] <- demig_outflow_agg[, names_est] /
+  demig_outflow_agg[, paste0(names_est, "_tot")]
+
+############
+#### Inflows
+demig_inflow_read <- readxl::read_xlsx(path = my_path, sheet = 2)
+demig_inflow <- demig_inflow_read %>% 
+   filter(Criterion == "COR",
+          Year %in% (1990:2024),
+          Gender == "Total") %>%
+  filter(`Coverage -Citizens/Foreigners/Both-` == "Both") %>%
+  mutate(weight = ifelse(Year %in% c(1990, 1995, 2000, 2005, 2010, 2015), 0.5, 1))
+
+# aggregate by period of five years 
+demig_inflow_agg <- data.frame(origin = character(), dest = character(),
+                                period = character(), Y = numeric())  
+for(p in 1990:2015) {
+  
+  demig_inflow_agg <-  rbind(demig_inflow_agg,
+    demig_inflow %>%
+      filter(Year %in% p:(p+5)) %>% 
+      group_by(`Reporting country`, `Country codes -UN based-`)  %>%
+      summarise(Y = sum(Value * weight),
+                weight = sum(weight)) %>%
+      mutate(Y = 5 * Y / weight, 
+             period = paste0(p, "-", p+5)) %>%
+      rename(origin = 2, dest = 1)
+  )
+}
+    
+demig_inflow_agg$dest <- countrycode(demig_inflow_agg$dest,  
+                                     "country.name", "iso3c")  
+
+demig_inflow_agg <- demig_inflow_agg %>%
+  filter(!is.na(dest)) %>%
+  filter(!is.na(origin)) %>%
+  filter(!is.na(Y)) %>%
+  select(-weight)
+
+# merge with the estimates
+demig_inflow_agg <- merge(all_estimates[all_estimates$type == "tot", ], 
+                 demig_inflow_agg[, c("origin", "dest", "period", "Y")], 
+                 by.x = c("origin", "dest", "year"),
+                 by.y = c("origin", "dest", "period"))
+
+# compute total inflows
+demig_inflow_agg_prop <- demig_inflow_agg %>%
+   group_by(dest, year) %>%
+   summarise(across(where(is.numeric), sum, na.rm = TRUE))
+colnames(demig_inflow_agg_prop)[-c(1, 2)] <- 
+  paste0(colnames(demig_inflow_agg_prop[, -c(1, 2)]), "_tot")
+
+demig_inflow_agg_prop[demig_inflow_agg_prop == 0] <- 1
+
+demig_inflow_agg <- merge(demig_inflow_agg, demig_inflow_agg_prop, 
+                          by = c("dest", "year"))
+demig_inflow_agg[, paste0(names_est, "_tot")] <- demig_inflow_agg[, names_est] /
+  demig_inflow_agg[, paste0(names_est, "_tot")]
+
+# Combine
+compare_mig <- rbind(demig_inflow_agg, demig_outflow_agg)
+
+# emigration / immigration
+# emigration
+compare_emig_2 <- merge(demig_outflow_agg_prop, temp_pop, by.x = c("origin", "year"),
+                       by.y = c("iso3", "period")) 
+compare_emig_2[, names_est] <- compare_emig_2[, paste0(names_est, "_tot")] /
+  compare_emig_2[, "pop"]
+# we only keep the 14 countries 
+compare_emig_2 <- compare_emig_2 %>% filter(origin %in% countries_of_interset_demig)
+
+# immigration
+compare_imig_2 <- merge(demig_inflow_agg_prop, temp_pop, by.x = c("dest", "year"),
+                       by.y = c("iso3", "period")) 
+compare_imig_2[, names_est] <- compare_imig_2[, paste0(names_est , "_tot")] /
+  compare_imig_2[, "pop"]
+# we only keep the 14 countries 
+compare_imig_2 <- compare_imig_2 %>% filter(dest %in% countries_of_interset_demig)
+
+# net
+net_mig <- merge(demig_inflow_agg_prop, demig_outflow_agg_prop, 
+                 by.x = c("dest", "year"),
+                 by.y = c("origin", "year"))
+net_mig[, names_est] <- net_mig[, paste0(names_est, "_tot.x")] - 
+  net_mig[, paste0(names_est, "_tot.y")] 
+
+# correlation
+mydata_new_demig_1 <- data.frame(
+  mig_measure = factor(c(rep("count", 14), rep("log", 14), rep("prop", 14), 
+                  rep("emig", 14), rep("immig", 14), rep("net", 14)), 
+                  levels = c("count", "log", "prop", "emig", "immig", "net")),
+  adjusted = factor(c(rep("raw", 3), rep("open", 5), rep("closed", 6)), 
+                    levels = c("raw", "open", "closed")),
+  method = factor(c("drop", "reverse", "mig. rate", 
+             "drop", "reverse", "mig. rate", "mini.", "OT",
+             "drop", "reverse", "mig. rate", "mini.", "OT", "PB"), 
+             levels = c("drop", "reverse", "mig. rate", "mini.", "OT", "PB")),
+  values = c(
+    as.numeric(cor(compare_mig[, "Y"],
+    compare_mig[, names_est[names_est != "Y"]])), 
+    as.numeric(cor(log(1 + compare_mig[, "Y"]),
+    log(1 + compare_mig[, names_est[names_est != "Y"]])) ),
+     as.numeric(cor(compare_mig[, "Y_tot"],
+    compare_mig[, paste0(names_est[names_est != "Y"], "_tot")])),
+    as.numeric(cor(compare_emig_2[, "Y"],
+    compare_emig_2[, names_est[names_est != "Y"]])), 
+    as.numeric(cor(compare_imig_2[, "Y"],
+    compare_imig_2[, names_est[names_est != "Y"]])), 
+        as.numeric(cor(net_mig[, "Y"],
+    net_mig[, names_est[names_est != "Y"]])) 
+    )
+)
+
+mydata_new_demig_1$data <- "DEMIG C2C"
+```
+
+* DEMIG (Source: https://www.migrationinstitute.org/publications/wp-88-14)
+```{r, warning = F, message = F}
+# Demig Total outflows
+demig_total <- read.csv2("data/Total Outflows-Tableau 1.csv")  
+demig_total[, 11:ncol(demig_total)] <- sapply(demig_total[, 11:ncol(demig_total)], 
+                                              as.numeric)
+emig <- demig_total %>% 
+   filter(Coverage == "Total") %>%
+  select(5, 11:ncol(demig_total)) %>%
+  rename(Country = 1) # %>% filter(Country %in% countries_of_interset_demig)
+
+emig <- emig %>%
+  pivot_longer(cols = 2:ncol(emig),
+               names_to = "year", values_to = "Y") %>%
+  mutate(year = as.numeric(substr(year, 2, 5))) %>%
+  mutate(weight = ifelse(year %in% c(1990, 1995, 2000, 2005, 2010, 2015, 2020), 0.5, 1)) %>%
+  filter(!is.na(Y))
+ 
+emig_agg <- data.frame(country = character(), period = character(), Y = numeric())  
+
+for(p in 1990:2015) {
+  
+  emig_agg <-  rbind(emig_agg,
+    emig %>%
+      filter(year %in% p:(p+5)) %>% 
+      group_by(Country)  %>%
+      summarise(Y = sum(Y * weight),
+                weight = sum(weight)) %>%
+      mutate(Y = 5 * Y / weight, 
+             period = paste0(p, "-", p+5)) %>%
+      filter(weight > 4.5)
+  )
+}
+# Note : Here, we include additional countries beyond those used in Abel and Cohen to increase the number of observations. To ensure data reliability, we require that each country has at least 5 observations within a given period.
+
+### merge with the estimates
+emig_agg <- merge(emig_agg, 
+      all_estimates[all_estimates$type == "tot", ] %>%
+  group_by(origin, year) %>%
+  summarise(across(where(is.numeric), sum, na.rm = TRUE)),
+  by.x = c('Country', 'period'), by.y = c("origin", "year"))
+
+# Demig Total inflows
+demig_total <- read.csv2("data/Total Inflows-Tableau 1.csv")  
+demig_total[, 11:ncol(demig_total)] <- sapply(demig_total[, 11:ncol(demig_total)], 
+                                              as.numeric)
+immig <- demig_total %>% 
+   filter(Coverage == "Total") %>%
+  select(5, 11:ncol(demig_total)) %>%
+  rename(Country = 1) # %>% filter(Country %in% countries_of_interset_demig)
+
+immig <- immig %>%
+  pivot_longer(cols = 2:ncol(immig),
+               names_to = "year", values_to = "Y") %>%
+  mutate(year = as.numeric(substr(year, 2, 5))) %>%
+  mutate(weight = ifelse(year %in% c(1990, 1995, 2000, 2005, 2010, 2015, 2020), 0.5, 1)) %>%
+  filter(!is.na(Y))
+ 
+immig_agg <- data.frame(country = character(), period = character(), Y = numeric())  
+
+for(p in 1990:2015) {
+  
+  immig_agg <-  rbind(immig_agg,
+    immig %>%
+      filter(year %in% p:(p+5)) %>% 
+      group_by(Country)  %>%
+      summarise(Y = sum(Y * weight),
+                weight = sum(weight)) %>%
+      mutate(Y = 5 * Y / weight, 
+             period = paste0(p, "-", p+5)) %>%
+      filter(weight > 4.5)
+  )
+}
+
+### merge with the estimates 
+immig_agg <- merge(immig_agg, 
+      all_estimates[all_estimates$type == "tot", ] %>%
+  group_by(dest, year) %>%
+  summarise(across(where(is.numeric), sum, na.rm = TRUE)),
+  by.x = c('Country', 'period'), by.y = c("dest", "year"))
+
+# net aggr
+net_agg_temp <- merge(immig_agg, emig_agg, by = c("Country", "period"))
+net_agg <- net_agg_temp[, c(1, 2)]
+net_agg[, names_est] <- net_agg_temp[, paste0(names_est, ".x")] - 
+  net_agg_temp[, paste0(names_est, ".y")]
+
+# merge with pop
+immig_agg <- merge(immig_agg, temp_pop,
+                   by.x = c("Country", "period"), by.y = c("iso3", "period"))
+immig_agg[, names_est] <- immig_agg[, names_est] / immig_agg[, "pop"]
+
+emig_agg <- merge(emig_agg, temp_pop,
+                   by.x = c("Country", "period"), by.y = c("iso3", "period"))
+emig_agg[, names_est] <- emig_agg[, names_est] / emig_agg[, "pop"]
+#################################
+
+# plot
+# correlation
+mydata_new_demig_2 <- data.frame(
+  mig_measure = factor(c(rep("emig", 14), rep("immig", 14), rep("net", 14)), 
+                  levels = c("emig", "immig", "net")),
+  adjusted = factor(c(rep("raw", 3), rep("open", 5), rep("closed", 6)), 
+                    levels = c("raw", "open", "closed")),
+  method = factor(c("drop", "reverse", "mig. rate", 
+             "drop", "reverse", "mig. rate", "mini.", "OT",
+             "drop", "reverse", "mig. rate", "mini.", "OT", "PB"), 
+             levels = c("drop", "reverse", "mig. rate", "mini.", "OT", "PB")),
+  values = c(
+    as.numeric(cor(emig_agg[, "Y"],
+      emig_agg[, names_est[names_est != "Y"]])), 
+    as.numeric(cor(immig_agg[, "Y"],
+      immig_agg[, names_est[names_est != "Y"]])), 
+    as.numeric(cor(net_agg[, "Y"],
+      net_agg[, names_est[names_est != "Y"]])) 
+    )
+)
+mydata_new_demig_2$data <- "DEMIG TOTAL"
+```
+
+* United Nations data basis (Source : https://www.kaggle.com/datasets/databeginner/un-migrationflow-2015):
+
+```{r, warning = F, message = F}
+name_files <- dir("data/archive-2/")
+
+countries_of_interset_un <- countrycode(
+  substr(name_files, 1, nchar(name_files)-5), origin = "country.name", "iso3c")
+
+un_flow_agg <- data.frame(origin = character(),
+                              dest = character(),
+                              period = character(),
+                              Y = numeric()) 
+for(k in 1:length(name_files)) {
+  nom_country <- substr(name_files[k], 1, nchar(name_files[k])-5)
+  my_path <- paste0("data/archive-2/", name_files[k])
+  un_flow <- readxl::read_xlsx(path = my_path, sheet = 2, skip = 20) 
+  un_flow$origin <- un_flow$OdName
+  un_flow$dest <- un_flow$OdName
+  un_flow[un_flow$Type == "Emigrants", "origin"] <- nom_country
+  un_flow[un_flow$Type == "Immigrants", "dest"] <- nom_country
+  
+  un_flow_long <- un_flow %>% 
+    select(-c(2:9))
+  un_flow_long[, 2:(ncol(un_flow_long) - 2)] <- sapply(
+    un_flow_long[, 2:(ncol(un_flow_long) - 2)], as.numeric)
+  un_flow_long <-  pivot_longer(un_flow_long, cols = 2:(ncol(un_flow_long) - 2), 
+                                names_to = "year", values_to = "Y") 
+  un_flow_long$Y <- as.numeric(un_flow_long$Y)
+  
+  # drop NA
+  un_flow_long <- un_flow_long[!is.na(un_flow_long$Y), ]
+  un_flow_long$year <- as.numeric(un_flow_long$year)
+  # aggregate by period
+  un_flow_long$weight <- 
+    ifelse(un_flow_long$year %in% c(1990, 1995, 2000, 2005, 2010, 2015, 2020), 0.5, 1)
+
+  for(p in 1990:2015) {
+  
+   un_flow_agg <-  rbind(un_flow_agg,
+    un_flow_long %>%
+      filter(year %in% p:(p+5)) %>% 
+      group_by(origin, dest, Type)  %>%
+      summarise(Y = sum(Y * weight),
+                weight = sum(weight)) %>%
+      mutate(Y = 5 * Y / weight) %>%
+      mutate(period = paste0(p, "-", p+5))
+    )
+   }  
+}
+un_flow_agg$origin <- countrycode::countrycode(un_flow_agg$origin, 
+                              origin = "country.name", "iso3c")
+un_flow_agg$dest <- countrycode::countrycode(un_flow_agg$dest, 
+                              origin = "country.name", "iso3c")
+```
+
+```{r, warning=F, message = F}
+#### Merge with our estimates
+compare_mig_un <- merge(all_estimates[all_estimates$type == "tot", ], 
+                     un_flow_agg[, c("origin", "dest", "period", "Y", "Type")], 
+                     by.x = c("origin", "dest", "year"),
+                     by.y = c("origin", "dest", "period"))
+compare_mig_un <- compare_mig_un[!is.na(compare_mig_un$Y), ]
+
+# compute proportion
+# emigrants
+compare_mig_em <- compare_mig_un %>%
+  filter(Type == "Emigrants") 
+
+compare_mig_em_agg <- compare_mig_em %>% 
+   group_by(origin, year) %>%
+   summarise(across(where(is.numeric), sum, na.rm = TRUE), n = n())
+colnames(compare_mig_em_agg)[-c(1, 2)] <- 
+  paste0(colnames(compare_mig_em_agg[, -c(1, 2)]), "_tot")
+
+# we avoid to divide by 0
+compare_mig_em_agg[compare_mig_em_agg == 0] <- 1
+
+compare_mig_em <- merge(compare_mig_em, compare_mig_em_agg, 
+                          by = c("origin", "year"))
+compare_mig_em[, paste0(names_est, "_prop")] <- compare_mig_em[, names_est] /
+  compare_mig_em[, paste0(names_est, "_tot")]
+  
+# Immigrants
+compare_mig_im <- compare_mig_un %>%
+  filter(Type == "Immigrants") 
+
+compare_mig_im_agg <- compare_mig_im %>% 
+   group_by(dest, year) %>%
+   summarise(across(where(is.numeric), sum, na.rm = TRUE), n = n())
+colnames(compare_mig_im_agg)[-c(1, 2)] <- 
+  paste0(colnames(compare_mig_im_agg[, -c(1, 2)]), "_tot")
+
+# we avoid to divide by 0
+compare_mig_im_agg[compare_mig_im_agg == 0] <- 1
+
+compare_mig_im <- merge(compare_mig_im, compare_mig_im_agg, 
+                          by = c("dest", "year"))
+compare_mig_im[, paste0(names_est, "_prop")] <- compare_mig_im[, names_est] /
+  compare_mig_im[, paste0(names_est, "_tot")]
+  
+# combine 
+compare_mig_un <- rbind(compare_mig_im, compare_mig_em)
+
+# emigration / immigration
+# emigration
+compare_emig_2 <- merge(compare_mig_em_agg, temp_pop, 
+        by.x = c("origin", "year"), by.y = c("iso3", "period")) 
+compare_emig_2[, names_est] <- compare_emig_2[, paste0(names_est, "_tot")] / 
+  compare_emig_2[, "pop"]
+
+# immigration
+compare_imig_2 <- merge(compare_mig_im_agg, temp_pop, 
+        by.x = c("dest", "year"),  by.y = c("iso3", "period")) 
+compare_imig_2[, names_est] <- compare_imig_2[, paste0(names_est, "_tot")] / 
+  compare_imig_2[, "pop"]
+
+# net
+net_agg_temp <- merge(compare_imig_2, compare_emig_2, 
+                      by.x = c("dest", "year"), by.y = c("origin", "year"))
+net_mig <- net_agg_temp[, c(1, 2)]
+net_mig[, names_est] <- net_agg_temp[, paste0(names_est, "_tot.x")] - 
+  net_agg_temp[, paste0(names_est, "_tot.y")]
+
+# correlation
+mydata_un <- data.frame(
+  mig_measure = factor(c(rep("count", 14), rep("log", 14), rep("prop", 14), 
+                  rep("emig", 14), rep("immig", 14), rep("net", 14)), 
+                  levels = c("count", "log", "prop", "emig", "immig", "net")),
+  adjusted = factor(c(rep("raw", 3), rep("open", 5), rep("closed", 6)), 
+                    levels = c("raw", "open", "closed")),
+  method = factor(c("drop", "reverse", "mig. rate", 
+             "drop", "reverse", "mig. rate", "mini.", "OT",
+             "drop", "reverse", "mig. rate", "mini.", "OT", "PB"), 
+             levels = c("drop", "reverse", "mig. rate", "mini.", "OT", "PB")),
+  values = c(
+    as.numeric(cor(compare_mig_un[, "Y"],
+      compare_mig_un[, names_est[names_est != "Y"]])), 
+    as.numeric(cor(log(1 + compare_mig_un[, "Y"]),
+      log(1 + compare_mig_un[, names_est[names_est != "Y"]])) ),
+    as.numeric(cor(compare_mig_un[, "Y_prop"],
+      compare_mig_un[, paste0(names_est[names_est != "Y"], "_prop")])),
+    as.numeric(cor(compare_emig_2[, "Y"],
+      compare_emig_2[, names_est[names_est != "Y"]])), 
+    as.numeric(cor(compare_imig_2[, "Y"],
+      compare_imig_2[, names_est[names_est != "Y"]])), 
+    as.numeric(cor(net_mig[, "Y"],
+      net_mig[, names_est[names_est != "Y"]])) 
+    )
+)
+mydata_un$data <- "UN DESA"
+```
+
+* WPP net (source : https://population.un.org/wpp/)
+```{r, message = F, warning = F}
+net_agg_wpp <- data.frame(country = character(), period = character(), 
+                          Y = numeric())  
+wpp2024_temp <- wpp2024 %>%
+  filter(!is.na(`Location code`), !is.na(Year), 
+         !is.na(`Net Number of Migrants (thousands)`)) %>%
+  mutate(Year = as.numeric(Year))
+
+for(p in 1990:2015) {
+  
+  net_agg_wpp <-  rbind(net_agg_wpp,
+    wpp2024_temp %>%
+      select(Year, `Location code`, `Net Number of Migrants (thousands)`) %>%
+      rename(year = 1, Country = 2, Y = 3) %>%
+      mutate(Y = as.numeric(Y)) %>% 
+      mutate(weight = ifelse(year %in% c(1990, 1995, 2000, 2005, 2010, 2015, 2020), 0.5, 1)) %>%
+      filter(year %in% p:(p+5)) %>% 
+      group_by(Country)  %>%
+      summarise(Y = sum(Y * weight),
+                weight = sum(weight)) %>%
+      mutate(Y = 5 * Y / weight) %>%
+      mutate(period = paste0(p, "-", p+5))
+  )
+}
+
+net_agg_wpp$Country <- countrycode::countrycode(net_agg_wpp$Country, 
+                              origin = "un", "iso3c")
+net_agg_wpp <- net_agg_wpp[!is.na(net_agg_wpp$Country), ]
+
+# emigration
+compare_emig_all <- all_estimates %>%
+     group_by(origin, year) %>%
+     summarise(across(where(is.numeric), sum, na.rm = TRUE))
+
+# immigration
+compare_imig_all <- all_estimates %>%
+     group_by(dest, year) %>%
+     summarise(across(where(is.numeric), sum, na.rm = TRUE))
+
+# net 
+net <- compare_imig_all
+net[, -c(1, 2)] <- compare_imig_all[, -c(1, 2)] - compare_emig_all[, -c(1, 2)]
+
+# net
+net_mig <- merge(net, net_agg_wpp, by.x = c("dest", "year"), 
+                 by.y = c("Country", "period"))
+
+# correlation
+mydata_un_tot <- data.frame(
+  mig_measure = factor(c(rep("net", 14)), 
+                  levels = c("count", "log", "prop", "emig", "immig", "net")),
+  adjusted = factor(c(rep("raw", 3), rep("open", 5), rep("closed", 6)), 
+                    levels = c("raw", "open", "closed")),
+  method = factor(c("drop", "reverse", "mig. rate", 
+             "drop", "reverse", "mig. rate", "mini.", "OT",
+             "drop", "reverse", "mig. rate", "mini.", "OT", "PB"), 
+             levels = c("drop", "reverse", "mig. rate", "mini.", "OT", "PB")),
+  values = c(
+        as.numeric(cor(net_mig[, "Y"],
+           net_mig[, names_est[names_est != "Y"]])) 
+    )
+)
+mydata_un_tot$data <- "UN WPP"
+```
+
+We plot the correlations between estimated migration flows during five-year periods from 1990–1995 to 2015–2020 from the different estimation methods with constructed five-year equivalent reported migration flows from four collections of migration statistics (figure 4 in the article).
+
+```{r}
+mydata_new <- rbind(mydata_new_demig_1, mydata_new_demig_2, mydata_un, mydata_un_tot)
+
+theme_heat <- theme_classic() +
+  theme(axis.line = element_blank(),
+        axis.ticks = element_blank())
+
+# basic plot
+levels(mydata_new$method)[4] <- "IPFP"
+mydata_new$method <- factor(mydata_new$method,
+          levels = c("drop", "reverse", "mig. rate", "IPFP", "PB", "OT"))  
+plot <- ggplot(mydata_new, aes(x = mig_measure, y = method)) +
+  geom_tile(aes(fill = values), color = "white") +
+  theme(aspect.ratio = 1) +
+  facet_grid(vars(adjusted), vars(data), scales = "free", space = "free") + theme_heat
+
+# plot with text overlay and viridis color palette
+plot + geom_text(aes(label = round(values, 2)), 
+                 color = "white") +
+  scale_fill_gradientn(colors = rev(hcl.colors(20, "RdYlGn"))) +
+    #   scale_fill_viridis(option = "viridis", limits=c(-1, 1), direction = -1) +
+      # formatting
+      ggtitle("", subtitle = "") +
+      labs(caption = "") +
+  xlab("Migration Measure") +
+  ylab("Estimation Method") +
+      theme(plot.title = element_text(face = "bold")) +
+      theme(plot.subtitle = element_text(face = "bold", color = "grey35")) +
+      theme(plot.caption = element_text(color = "grey68"))
+ggsave("figures/DEMIG.pdf", width = 10, height = 8)
+```
+
+
+# Vizualisation 
+
+We aim to reproduce the flow map displayed in Figure 5 of the article. As a first step, we aggregate individual countries into broader regions to simplify the visualisation.
+
+```{r}
+# list of regions 
+levels_S <- c(
+   "N.Europe", "W.Europe", "E.Europe", "S.Europe",
+ "N.Africa", "S.-S.Africa", 
+ "W.Asia",  "S.Asia", "S.-E.Asia", 
+ "C.Asia", "E.Asia",
+ "Aust. & New Z.", "Pacific Isl.", 
+ "N.America", "L.America & Carib.")
+labels_S <- c(
+   "Northern Europe", "Western Europe", "Eastern Europe", "Southern Europe",
+ "Northern Africa", "Sub-Saharan Africa", 
+ "Western Asia",  "Southern Asia", "South-Eastern Asia", 
+ "Central Asia", "Eastern Asia",
+ "Australia and New Zealand", "Pacific Islands", 
+ "Northern America", "Latin America and the Caribbean")
+
+
+# prepare the table
+tab_iso_reg <- st_drop_geometry(GeoDATA)[, c("ISO3","SREGION" )]
+
+tab_iso_reg$SREGION <- gsub("Micronesia", "Pacific Islands", tab_iso_reg$SREGION)
+tab_iso_reg$SREGION <- gsub("Polynesia", "Pacific Islands", tab_iso_reg$SREGION)
+tab_iso_reg$SREGION <- gsub("Melanesia", "Pacific Islands", tab_iso_reg$SREGION)
+
+tab_iso_reg$SREGION <- factor(tab_iso_reg$SREGION, 
+                              levels = labels_S , labels = levels_S)
+
+q4 <- qualitative_hcl(length(levels_S), palette = "Dark 3")
+names(q4) <- levels_S
+
+our_estimates_reg <- all_estimates
+our_estimates_reg <- merge(our_estimates_reg, tab_iso_reg,
+                           by.x = "origin", by.y = "ISO3")  
+our_estimates_reg <- merge(our_estimates_reg, tab_iso_reg,
+                           by.x = "dest", by.y = "ISO3") 
+our_estimates_reg <- aggregate(our_estimates_reg[, 
+     !(names(our_estimates_reg) %in% c("dest", "origin", "year", 
+          "type", "SREGION.x", "SREGION.y"))], 
+                               by = list(origin = our_estimates_reg$SREGION.x,
+                                         dest = our_estimates_reg$SREGION.y,
+                                         year = our_estimates_reg$year,
+                                         type = our_estimates_reg$type),
+                               FUN = sum) 
+## prepare the spatial data
+GeoDATA$SREGION <- gsub("Micronesia", "Pacific Islands", GeoDATA$SREGION)
+GeoDATA$SREGION <- gsub("Polynesia", "Pacific Islands", GeoDATA$SREGION)
+GeoDATA$SREGION <- gsub("Melanesia", "Pacific Islands", GeoDATA$SREGION)
+
+
+countries_regions <- GeoDATA %>%
+  rmapshaper::ms_simplify(, keep = 0.05, keep_shapes = T)
+
+contours_map <- aggregate(countries_regions[, 1], 
+                   by = list(S = countries_regions$SREGION), 
+                   FUN = length)
+contours_map <- st_transform(contours_map, "+proj=moll")
+contours_map$S <- factor(contours_map$S, levels = labels_S , labels = levels_S)
+
+xy_sf <- st_centroid(contours_map)
+```
+
+We plot the estimated migration flows between 15 geographic regions for 2020–2024 (top) and 2015–2020 (bottom), using two methods: Optimal Transport with Open Stocks (left) and Closed Stock-Adjusted Tables (right). In each regional panel, the left bar indicates total outgoing flows, the right bar total incoming flows, and the bottom bar intra-regional flows (i.e., movements within the same region). The widths of the bars and flow lines are proportional to the estimated flow volumes. Flow directions are indicated by arrows. A distinct color is assigned to each region for clarity (figure 5 in the article).
+
+```{r, echo = F, eval = T, fig.width = 12, fig.height = 6.5, warning = F, message = F}
+max_y <- max(sapply(our_estimates_reg[our_estimates_reg$year %in% c("2020-2024"), 
+                               -c(1, 2, 3, 4)], max)) * 10^(-6)
+
+contours2 <- st_transform(contours_map, 3035)
+xy_sf2 <- st_as_sf(data.frame(
+  S = contours2$S,
+  long = c(15471576.8, 8196674.9, 10085309.4,  5854515.2, -3550225.0,  4904041.6,
+         531973.2, 4423595.1, 12933951.2, 12943632.3,  10292809.6,  4063352.7,
+         5528469.7, 7605684.2, 4043567.5),
+  lat = c(5469002.2, 4127363.1, 6439420.5, 3283226.7, 569242.3, 377954.3, 7731898.1,
+         4330461.4, 10071541.3, 5251441.7, 3298628.2, 2110327.6, -2107136.6, 1299905.2,
+         2823785.0)), coords = c("long", "lat"))
+## Map flows
+source("codes/plot_flows_unique.R")
+contours2$S <- as.character(contours2$S)
+title_vec <- c("OT (open)", "OT (closed)", "PB")
+for(year_k in c("2020-2024", "2015-2020")) {
+  temp_k <- our_estimates_reg %>% 
+    filter(type == "tot", year == year_k) 
+  for(k in 1:3) {
+    my_est_names <- c("hat_transport_open", "hat_transport_closed", "hat_pb")[k]
+  pdf(paste0("figures/flow_map_", my_est_names, "_", year_k, ".pdf"),
+      width = 8, height = 5.5)
+  par(oma = c(0, 0, 0, 0), mar = c(0, 0, 0, 0), mgp = c(-1, 0, 0))
+    mig_flow <- temp_k[, c("origin", "dest", my_est_names)]
+  names(mig_flow)[3] <- "y"
+  y <- mig_flow$y
+  index_o <- mig_flow$origin
+  index_d <- mig_flow$dest
+plot(st_geometry(contours2), border = "white", col = "lightgrey", 
+     lwd = 0.1, 
+     ylim = c(-0.45*10^7, 1*10^7), asp = 1.,
+     ylab = ifelse(k == 1, year_k, ""))
+if(year_k == "2020-2024")
+  title(paste0(title_vec[k]), line = -1, cex = 0.9)
+  # plot(st_geometry(world_union), border = rgb(0.4, 0.4, 0.4), add = T)
+  plot_flows_unique(
+    y * 10^(-6), # value of the flow
+    as.character(index_o), # label of the origin
+    as.character(index_d),  # label of the destination
+    geo_site = contours2,  # the geographic coordinates of the sites: polygon or points of class sf
+    column_name = "S", # the column name of the regions in geo_site sf object and/or in xy_sf
+    add = T,   # if add = T, the arcs and only the arcs will printed on the existing device
+    type = "barchart", # if T plot barplot for outloflows/inflows and intra flows
+    xy_sf = xy_sf2, # possibility to give different coordinates of the starting and ending flows (by default, it corresponds to the centroid of geo_site)
+    select_o = NULL, # the origin sites to print
+    select_d = NULL, # the destination site to print
+    select_bar = NULL, # the sites to print the barplot
+    select_flows =NULL, # a vector of logical of size N indicating the flows to be printed
+    col_site = NULL, # a vector of colors with attribute names equal to the name of the sites
+    transparency = list(alpha = c(0.3, 0.6, 1), 
+                      range = c(0, 100000 * 10^(-6), max(y * 10^(-6)))), # two scalars to define the values of the minimum and maximum transparency
+    width_arc = c(0.6, max_y), # a flow equals to max(flows) is represented by an arc of width 1 
+    size_head_arc = 1, # the size of the ending and starting of the arrows
+    reduce_arc = 1.2, # the percentage of reduction of the flow
+    percent_arc = 0.25, # the percentage of flows to represent
+    width_bar = 0.95, # the width of the barplot
+    lwd_bar = 0.1,   # the lwd of the bar
+    percent_bar = 1, # the percentage of barplot to print
+    col_direction = "outflows", # a character among "outflows", "inflows", "none"; by default, the outflows will be plotted in color
+    col_geometry = "lightgrey",  # color inside the polygons
+    border_geometry = "white", # color of the contours 
+    lwd_geometry = 0.5, # width of the contours,
+    print_names = F, # print the names of the sites on the map
+    size_names = 1, # size of the names if printed
+    print_legend = ifelse(k == 2 & year_k == "2015-2020", T, F), # legend for the width of the flows
+    pos_legend = "bottomright", # position of the legend
+    values_legend = c(1, 2.5, 5), # values of the flows to be printed on the legend
+    size_legend = 0.7, # size of the characters in the legend
+    horiz_legend = F, # by default vertical
+    title_legend = "Flows (in M.)", # the name of the legend
+    digit_legend = 2, # number of digits to keep in legend
+    bezier = F
+    )
+   dev.off()
+  }
+}
+```
+
+We print the Top 5 flows:
+```{r}
+our_estimates_reg %>% 
+  filter(type == "tot", year == "2020-2024") %>% 
+  arrange(-hat_transport_open) %>% 
+  select(origin, dest, hat_transport_open)
+our_estimates_reg %>% 
+  filter(type == "tot", year == "2020-2024") %>% 
+  arrange(-hat_transport_closed) %>% 
+  select(origin, dest, hat_transport_closed)
+
+```
+
+We print the total outflows (to get the percentages):
+```{r}
+our_estimates_reg %>% 
+  filter(type == "tot", year == "2020-2024") %>% 
+  group_by(origin)%>%
+  summarise(across(where(is.numeric), sum, na.rm = TRUE)) %>%
+  select(origin, hat_transport_open, hat_transport_closed)
+```
+
+
+We print the differences between the two periods:
+```{r}
+data.frame(
+  origin = our_estimates_reg[our_estimates_reg$year %in% c("2020-2024") & 
+                              our_estimates_reg$type == "tot" , "origin"],
+  dest = our_estimates_reg[our_estimates_reg$year %in% c("2020-2024") & 
+                              our_estimates_reg$type == "tot", "dest"],
+  year_0 = our_estimates_reg[our_estimates_reg$year %in% c("2015-2020") & 
+                              our_estimates_reg$type == "tot", "hat_transport_open"],
+  year_1 = our_estimates_reg[our_estimates_reg$year %in% c("2020-2024") & 
+                              our_estimates_reg$type == "tot", "hat_transport_open"],
+  diff = our_estimates_reg[our_estimates_reg$year %in% c("2020-2024") & 
+                              our_estimates_reg$type == "tot", "hat_transport_open"]
+- our_estimates_reg[our_estimates_reg$year %in% c("2015-2020") & 
+                              our_estimates_reg$type == "tot", "hat_transport_open"]) %>%
+  arrange(-abs(diff)) %>%
+  head(5)
+data.frame(
+  origin = our_estimates_reg[our_estimates_reg$year %in% c("2020-2024") & 
+                              our_estimates_reg$type == "tot" , "origin"],
+  dest = our_estimates_reg[our_estimates_reg$year %in% c("2020-2024") & 
+                              our_estimates_reg$type == "tot", "dest"],
+  year_0 = our_estimates_reg[our_estimates_reg$year %in% c("2015-2020") & 
+                              our_estimates_reg$type == "tot", "hat_transport_closed"],
+  year_1 = our_estimates_reg[our_estimates_reg$year %in% c("2020-2024") & 
+                              our_estimates_reg$type == "tot", "hat_transport_closed"],
+  diff = our_estimates_reg[our_estimates_reg$year %in% c("2020-2024") & 
+                              our_estimates_reg$type == "tot", "hat_transport_closed"]
+- our_estimates_reg[our_estimates_reg$year %in% c("2015-2020") & 
+                              our_estimates_reg$type == "tot", "hat_transport_closed"]) %>%
+  arrange(-abs(diff)) %>%
+  head(5)
+```
+
+
+
+## Regional visualization of migration flows estimated by OT
+
+We print the plots obtained in Appendix E. 
+
+### Africa 
+
+Estimated intra-regional migration flows for Africa, derived from the Optimal Transport (OT) model applied to the open-adjusted bilateral stock tables. Results for the two most recent periods (2015–2020 and 2020–2024) are shown, along with the largest bilateral migration flows and the main countries of origin in terms of total outflows (Figure 15 in the article).
+
+```{r, echo = F, eval = T, fig.width = 12, fig.height = 6.5, warning = F, message = F}
+max_y <- 200000
+countries_regions_crs <- st_transform(countries_regions, 10592)
+
+# sahara
+world_iso_3_agg <- countries_regions_crs
+world_iso_3_agg$ISO3[world_iso_3_agg$ISO3 == "ESH"] <- "MAR"
+world_iso_3_agg <- aggregate(world_iso_3_agg[, "ISO3"], 
+          by = list(iso3 = world_iso_3_agg$ISO3),
+          FUN = length)
+# fontiere Maroc / Sahara 
+frontiers <- st_intersection(countries_regions_crs[countries_regions_crs$ISO3 == "MAR", ], 
+                countries_regions_crs[countries_regions_crs$ISO3 == "ESH", ])
+
+# Africa
+bb_africa <- st_as_sfc(st_bbox(c(xmin = -5 * 10^6, xmax = 4 * 10^6, 
+                       ymax = 4 * 10^6, ymin = -5 * 10^6), 
+                     crs = st_crs(10592)))
+
+ind_intersect <- st_intersects(countries_regions_crs, bb_africa)
+contours2 <- countries_regions_crs[sapply(ind_intersect, function(x) length(x) > 0),]
+africa <- countries_regions_crs[countries_regions_crs$CONTINENT == "AFRICA", ]
+countries_af <- na.omit(africa$"ISO3")
+
+## Map flows
+contours2$S <- as.character(contours2$ISO3)
+xy_sf2 <- st_centroid(contours2)
+
+for(year_k in c("2020-2024", "2015-2020")) {
+  temp_k <- all_estimates %>% 
+    filter(type == "tot", year == year_k) %>%
+    filter(origin %in% countries_af & dest %in% contours2$S | 
+             origin %in% contours2$S & dest %in% countries_af) 
+  # Top 10 flows
+  temp_k %>% arrange(-hat_transport_open) %>% select(origin, dest, hat_transport_open)  %>% head(10) %>% print()
+  # Top 10 outflows
+  temp_k %>% group_by(origin) %>% summarise(sum = sum(hat_transport_open)) %>% arrange(-sum) %>% select(origin, sum)  %>% head(10) %>% print()
+  for(k in 1:1) {
+    my_est_names <- c("hat_transport_open", "hat_transport_closed")[k]
+  pdf(paste0("figures/Africa_", my_est_names, "_", year_k, ".pdf"),
+      width = 6, height = 6.5)
+  par(oma = c(0, 0, 0, 0), mar = c(0, 0, 0, 0), mgp = c(-1, 0, 0))
+    mig_flow <- temp_k[, c("origin", "dest", my_est_names)]
+  names(mig_flow)[3] <- "y"
+  y <- mig_flow$y
+  index_o <- mig_flow$origin
+  index_d <- mig_flow$dest
+plot(st_geometry(bb_africa), border = "white",  asp = 1.1,
+     xlab = ifelse(k == 1, year_k, ""))
+plot(st_geometry(world_iso_3_agg), border = "white", 
+     col = "lightgrey", lwd = 0.15, asp = 1.,
+     xlab = year_k, add = T)
+plot(st_geometry(frontiers), add = T, col = rgb(0.85, 0.85, 0.85), lty = 2, lwd = 0.05)
+  # plot(st_geometry(world_union), border = rgb(0.4, 0.4, 0.4), add = T)
+  plot_flows_unique(
+    y, # value of the flow
+    index_o = as.character(index_o), # label of the origin
+    index_d = as.character(index_d),  # label of the destination
+    geo_site = contours2,  # the geographic coordinates of the sites: polygon or points of class sf
+    column_name = "S", # the column name of the regions in geo_site sf object and/or in xy_sf
+    add = T,   # if add = T, the arcs and only the arcs will printed on the existing device
+    type = "barchart", # if T plot barplot for outloflows/inflows and intra flows
+    xy_sf = xy_sf2, # possibility to give different coordinates of the starting and ending flows (by default, it corresponds to the centroid of geo_site)
+    select_o = NULL, # the origin sites to print
+    select_d = NULL, # the destination site to print
+    select_bar = countries_af, # the sites to print the barplot
+    select_flows =NULL, # a vector of logical of size N indicating the flows to be printed
+    col_site = NULL, # a vector of colors with attribute names equal to the name of the sites
+    transparency = list(alpha = c(0.3, 0.6, 1), 
+                      range = c(0, 100000, max(y))), # two scalars to define the values of the minimum and maximum transparency
+    width_arc = c(0.15, max_y), # a flow equals to max(flows) is represented by an arc of width 1 
+    size_head_arc = 1, # the size of the ending and starting of the arrows
+    reduce_arc = 1.2, # the percentage of reduction of the flow
+    percent_arc = 0.1, # the percentage of flows to represent
+    width_bar = 0.95, # the width of the barplot
+    lwd_bar = 0.1,   # the lwd of the bar
+    percent_bar = 1, # the percentage of barplot to print
+    col_direction = "outflows", # a character among "outflows", "inflows", "none"; by default, the outflows will be plotted in color
+    col_geometry = "lightgrey",  # color inside the polygons
+    border_geometry = "white", # color of the contours 
+    lwd_geometry = 0.5, # width of the contours,
+    print_names = F, # print the names of the sites on the map
+    size_names = 1, # size of the names if printed
+    print_legend = ifelse(year_k == "2015-2020", T, F), # legend for the width of the flows
+    pos_legend = "bottomleft", # position of the legend
+    values_legend = c(100000, 200000, 500000), # values of the flows to be printed on the legend
+    size_legend = 0.7, # size of the characters in the legend
+    horiz_legend = F, # by default vertical
+    title_legend = "Flows", # the name of the legend
+    digit_legend = 2, # number of digits to keep in legend
+    bezier = F
+    )
+      if (year_k == "2015-2020") {
+        x_start <- -4.5 * 10^6
+        y_start <- -4*10^6
+        lines(x_start + c(0, 500000), c(y_start, y_start), lwd = 3)
+        text(x_start + 250000, y_start, "500 km", pos = 3, cex = 0.8)
+      }
+   dev.off()
+  }
+}
+```
+
+
+### America
+
+Estimated intra-regional migration flows for Americas, derived from the Optimal Transport (OT) model applied to the open-adjusted bilateral stock tables. Results for the two most recent periods (2015–2020 and 2020–2024) are shown, along with the largest bilateral migration flows and the main countries of origin in terms of total outflows (Figure 16 in the article).
+
+```{r, echo = F, eval = T, fig.width = 12, fig.height = 6.5, warning = F, message = F}
+max_y <- 600000
+# America
+america <- st_transform(
+  countries_regions_crs[countries_regions_crs$CONTINENT == "AMERICAS", ], 31969)
+
+bb_america <- st_as_sfc(st_bbox(c(xmin = -0.2 * 10^7, xmax = 0.8 * 10^7, 
+                       ymax = 0.6 * 10^7, ymin = -0.65 * 10^7), 
+                     crs = st_crs(31969)))
+
+ind_intersect <- st_intersects(america, bb_america)
+contours2 <- america[sapply(ind_intersect, function(x) length(x) > 0),]
+
+contours2 <-st_transform(
+  countries_regions_crs[countries_regions_crs$CONTINENT == "AMERICAS", ], 31969)
+
+ 
+countries_am <- na.omit(america$"ISO3")
+
+## Map flows
+contours2$S <- as.character(contours2$ISO3)
+xy_sf2 <- st_centroid(contours2)
+xy_sf2$geometry[29] <- xy_sf2$geometry[29] + c(300000, -1250000 )
+xy_sf2$geometry[53] <- xy_sf2$geometry[53] + c(-200000, -650000 )
+
+for(year_k in c("2020-2024", "2015-2020")) {
+  temp_k <- all_estimates %>% 
+    filter(type == "tot", year == year_k) %>%
+    filter(origin %in% countries_am & dest %in% contours2$S | 
+             origin %in% contours2$S & dest %in% countries_am) 
+   # Top 10 flows
+  temp_k %>% arrange(-hat_transport_open) %>% select(origin, dest, hat_transport_open)  %>% head(10) %>% print()
+  # Top 10 outflows
+  temp_k %>% group_by(origin) %>% summarise(sum = sum(hat_transport_open)) %>% arrange(-sum) %>% select(origin, sum)  %>% head(10) %>% print()
+  for(k in 1:1) {
+    my_est_names <- c("hat_transport_open", "hat_transport_closed")[k]
+  pdf(paste0("figures/America_", my_est_names, "_", year_k, ".pdf"),
+      width = 5.5, height = 6.5)
+  par(oma = c(0, 0, 0, 0), mar = c(0, 0, 0, 0), mgp = c(-1, 0, 0))
+    mig_flow <- temp_k[, c("origin", "dest", my_est_names)]
+  names(mig_flow)[3] <- "y"
+  y <- mig_flow$y
+  index_o <- mig_flow$origin
+  index_d <- mig_flow$dest
+plot(st_geometry(bb_america), border = "white",  asp = 1,
+     xlab = ifelse(k == 1, year_k, ""))
+plot(st_geometry(contours2), border = "white", 
+     col = "lightgrey", lwd = 0.1, asp = 1.,
+     xlab = year_k, add = T)
+
+  # plot(st_geometry(world_union), border = rgb(0.4, 0.4, 0.4), add = T)
+  plot_flows_unique(
+    y, # value of the flow
+    index_o = as.character(index_o), # label of the origin
+    index_d = as.character(index_d),  # label of the destination
+    geo_site = contours2,  # the geographic coordinates of the sites: polygon or points of class sf
+    column_name = "S", # the column name of the regions in geo_site sf object and/or in xy_sf
+    add = T,   # if add = T, the arcs and only the arcs will printed on the existing device
+    type = "barchart", # if T plot barplot for outloflows/inflows and intra flows
+    xy_sf = xy_sf2, # possibility to give different coordinates of the starting and ending flows (by default, it corresponds to the centroid of geo_site)
+    select_o = NULL, # the origin sites to print
+    select_d = NULL, # the destination site to print
+    select_bar = countries_am, # the sites to print the barplot
+    select_flows =NULL, # a vector of logical of size N indicating the flows to be printed
+    col_site = NULL, # a vector of colors with attribute names equal to the name of the sites
+    transparency = list(alpha = c(0.3, 0.6, 1), 
+                      range = c(0, 300000, max(y))), # two scalars to define the values of the minimum and maximum transparency
+    width_arc = c(0.15, max_y), # a flow equals to max(flows) is represented by an arc of width 1 
+    size_head_arc = 1, # the size of the ending and starting of the arrows
+    reduce_arc = 1.2, # the percentage of reduction of the flow
+    percent_arc = 0.05, # the percentage of flows to represent
+    width_bar = 0.95, # the width of the barplot
+    lwd_bar = 0.1,   # the lwd of the bar
+    percent_bar = 1, # the percentage of barplot to print
+    col_direction = "outflows", # a character among "outflows", "inflows", "none"; by default, the outflows will be plotted in color
+    col_geometry = "lightgrey",  # color inside the polygons
+    border_geometry = "white", # color of the contours 
+    lwd_geometry = 0.5, # width of the contours,
+    print_names = F, # print the names of the sites on the map
+    size_names = 1, # size of the names if printed
+    print_legend = ifelse(year_k == "2015-2020", T, F), # legend for the width of the flows
+    pos_legend = "bottomleft", # position of the legend
+    values_legend = c(100000, 200000, 500000), # values of the flows to be printed on the legend
+    size_legend = 0.7, # size of the characters in the legend
+    horiz_legend = F, # by default vertical
+    title_legend = "Flows", # the name of the legend
+    digit_legend = 2, # number of digits to keep in legend
+    bezier = F
+    )
+    if (year_k == "2015-2020") {
+    x_start <- -2 * 10^6
+    y_start <- -6*10^6
+    lines(x_start + c(0, 500000), c(y_start, y_start), lwd = 3)
+    text(x_start + 250000, y_start, "500 km", pos = 3, cex = 0.8)
+  }
+   dev.off()
+  }
+}
+```
+
+
+### Europe
+
+Estimated intra-regional migration flows for Europe, derived from the Optimal Transport (OT) model applied to the open-adjusted bilateral stock tables. Results for the two most recent periods (2015–2020 and 2020–2024) are shown, along with the largest bilateral migration flows and the main countries of origin in terms of total outflows (Figure 17 in the article).
+
+```{r, echo = F, eval = T, fig.width = 12, fig.height = 6.5, warning = F, message = F}
+max_y <- 600000
+# America
+europe <- st_transform(countries_regions_crs, 27704)
+
+bb_europe <- st_as_sfc(st_bbox(c(xmin = 1789694.0, xmax = 7535494.5, 
+                       ymax = 4141538.0, ymin = -324339.5), 
+                     crs = st_crs(27704)))
+
+ind_intersect <- st_intersects(europe, bb_europe)
+contours2 <- europe[sapply(ind_intersect, function(x) length(x) > 0),]
+
+# sahara
+world_iso_3_agg <- contours2
+world_iso_3_agg$ISO3[world_iso_3_agg$ISO3 == "ESH"] <- "MAR"
+world_iso_3_agg <- aggregate(world_iso_3_agg[, "ISO3"], 
+          by = list(iso3 = world_iso_3_agg$ISO3),
+          FUN = length)
+# fontiere Maroc / Sahara 
+frontiers <- st_intersection(contours2[contours2$ISO3 == "MAR", ], 
+                contours2[contours2$ISO3 == "ESH", ])
+
+#contours2 <- st_transform(
+#  countries_regions_crs[countries_regions_crs$CONTINENT == "EUROPE", ], 27704)
+
+countries_eu <- na.omit(contours2$"ISO3")
+
+## Map flows
+contours2$S <- as.character(contours2$ISO3)
+xy_sf2 <- st_centroid(contours2)
+xy_sf2$geometry[54] <- xy_sf2$geometry[54] + c(-1150000, -2450000 )
+#xy_sf2$geometry[53] <- xy_sf2$geometry[53] + c(-200000, -650000 )
+
+bb_europe <- st_as_sfc(st_bbox(c(xmin = 1589694.0, xmax = 7535494.5, 
+                       ymax = 4141538.0, ymin = -104339.5), 
+                     crs = st_crs(27704)))
+
+for(year_k in c("2020-2024", "2015-2020")) {
+  temp_k <- all_estimates %>% 
+    filter(type == "tot", year == year_k) %>%
+    filter(origin %in% countries_eu & dest %in% contours2$S | 
+             origin %in% contours2$S & dest %in% countries_eu) 
+    # Top 10 flows
+  temp_k %>% arrange(-hat_transport_open) %>% select(origin, dest, hat_transport_open)  %>% 
+    head(10) %>% print()
+  # Top 10 outflows
+  temp_k %>% group_by(origin) %>% summarise(sum = sum(hat_transport_open)) %>% arrange(-sum) %>% select(origin, sum)  %>% 
+    head(10) %>% print()
+  for(k in 1:1) {
+    my_est_names <- c("hat_transport_open", "hat_transport_closed")[k]
+  pdf(paste0("figures/Europe_", my_est_names, "_", year_k, ".pdf"),
+      width = 8, height = 6)
+  par(oma = c(0, 0, 0, 0), mar = c(0, 0, 0, 0), mgp = c(-1.5, 0, 0))
+    mig_flow <- temp_k[, c("origin", "dest", my_est_names)]
+  names(mig_flow)[3] <- "y"
+  y <- mig_flow$y
+  index_o <- mig_flow$origin
+  index_d <- mig_flow$dest
+plot(st_geometry(bb_europe), border = "white",  asp = 1,
+     ylab = ifelse(k == 1, year_k, ""))
+plot(st_geometry(world_iso_3_agg), border = "white", 
+     col = "lightgrey", lwd = 0.15, asp = 1.,
+     xlab = year_k, add = T)
+plot(st_geometry(frontiers), add = T, col = rgb(0.85, 0.85, 0.85), 
+     lty = 2, lwd = 0.05)
+
+  # plot(st_geometry(world_union), border = rgb(0.4, 0.4, 0.4), add = T)
+  plot_flows_unique(
+    y, # value of the flow
+    index_o = as.character(index_o), # label of the origin
+    index_d = as.character(index_d),  # label of the destination
+    geo_site = contours2,  # the geographic coordinates of the sites: polygon or points of class sf
+    column_name = "S", # the column name of the regions in geo_site sf object and/or in xy_sf
+    add = T,   # if add = T, the arcs and only the arcs will printed on the existing device
+    type = "barchart", # if T plot barplot for outloflows/inflows and intra flows
+    xy_sf = xy_sf2, # possibility to give different coordinates of the starting and ending flows (by default, it corresponds to the centroid of geo_site)
+    select_o = NULL, # the origin sites to print
+    select_d = NULL, # the destination site to print
+    select_bar = countries_eu, # the sites to print the barplot
+    select_flows =NULL, # a vector of logical of size N indicating the flows to be printed
+    col_site = NULL, # a vector of colors with attribute names equal to the name of the sites
+    transparency = list(alpha = c(0.3, 0.6, 1), 
+                      range = c(0, 300000, max(y))), # two scalars to define the values of the minimum and maximum transparency
+    width_arc = c(0.15, max_y), # a flow equals to max(flows) is represented by an arc of width 1 
+    size_head_arc = 1, # the size of the ending and starting of the arrows
+    reduce_arc = 1.2, # the percentage of reduction of the flow
+    percent_arc = 0.05, # the percentage of flows to represent
+    width_bar = 0.95, # the width of the barplot
+    lwd_bar = 0.1,   # the lwd of the bar
+    percent_bar = 1, # the percentage of barplot to print
+    col_direction = "outflows", # a character among "outflows", "inflows", "none"; by default, the outflows will be plotted in color
+    col_geometry = "lightgrey",  # color inside the polygons
+    border_geometry = "white", # color of the contours 
+    lwd_geometry = 0.5, # width of the contours,
+    print_names = F, # print the names of the sites on the map
+    size_names = 1, # size of the names if printed
+    print_legend = ifelse(year_k == "2015-2020", T, F), # legend for the width of the flows
+    pos_legend = "bottomleft", # position of the legend
+    values_legend = c(100000, 200000, 500000), # values of the flows to be printed on the legend
+    size_legend = 0.7, # size of the characters in the legend
+    horiz_legend = F, # by default vertical
+    title_legend = "Flows", # the name of the legend
+    digit_legend = 2, # number of digits to keep in legend
+    bezier = F
+    )
+  if (year_k == "2015-2020") {
+    x_start <- 1.7 * 10^6
+    y_start <- 0.1*10^6
+    lines(x_start + c(0, 500000), c(y_start, y_start), lwd = 3)
+    text(x_start + 250000, y_start, "500 km", pos = 3, cex = 0.8)
+  }
+  dev.off()
+  }
+}
+```
+
+### Asia
+
+Estimated intra-regional migration flows for Asia, derived from the Optimal Transport (OT) model applied to the open-adjusted bilateral stock tables. Results for the two most recent periods (2015–2020 and 2020–2024) are shown, along with the largest bilateral migration flows and the main countries of origin in terms of total outflows (Figure 18 in the article).
+
+
+```{r, echo = F, eval = T, fig.width = 12, fig.height = 6.5, warning = F, message = F}
+max_y <- 300000
+# Asia
+asia <- st_transform(countries_regions_crs, 10594)
+
+bb_asia <- st_as_sfc(st_bbox(c(xmin = -.5 * 10^7, xmax = .8 * 10^7, 
+                       ymax = .07 * 10^7, ymin = -.7 * 10^7), 
+                     crs = st_crs(10594)))
+
+ind_intersect <- st_intersects(asia, bb_asia)
+contours2 <- asia[sapply(ind_intersect, function(x) length(x) > 0),]
+countries_as <- na.omit(contours2$"ISO3")
+
+## Map flows
+contours2$S <- as.character(contours2$ISO3)
+xy_sf2 <- st_centroid(contours2)
+ind_c <- sapply(c("IND", "RUS", "IDN", "MYS"), function(x) grep(x, contours2$S))
+
+
+xy_sf2$geometry[ind_c[1]] <- xy_sf2$geometry[ind_c[1]] + c(-300000, -850000 )
+xy_sf2$geometry[ind_c[2]] <- xy_sf2$geometry[ind_c[2]] + c(600000, -1400000 )
+xy_sf2$geometry[ind_c[3]] <- xy_sf2$geometry[ind_c[3]] + c(00000, -900000 )
+xy_sf2$geometry[ind_c[4]] <- xy_sf2$geometry[ind_c[4]] + c(-1100000, 100000)
+
+
+bb_asia <- st_as_sfc(st_bbox(c(xmin = -.5 * 10^7, xmax = .8 * 10^7, 
+                       ymax = .07 * 10^7, ymin = -.7 * 10^7), 
+                     crs = st_crs(10594)))
+
+for(year_k in c("2020-2024", "2015-2020")) {
+  temp_k <- all_estimates %>% 
+    filter(type == "tot", year == year_k) %>%
+    filter(origin %in% countries_as & dest %in% contours2$S | 
+             origin %in% contours2$S & dest %in% countries_as) 
+    # Top 10 flows
+  temp_k %>% arrange(-hat_transport_open) %>% select(origin, dest, hat_transport_open)  %>% head(10) %>% print()
+  # Top 10 outflows
+  temp_k %>% group_by(origin) %>% summarise(sum = sum(hat_transport_open)) %>% arrange(-sum) %>% select(origin, sum)  %>% head(10) %>% print()
+  for(k in 1:1) {
+    my_est_names <- c("hat_transport_open", "hat_transport_closed")[k]
+   pdf(paste0("figures/Asia_", my_est_names, "_", year_k, ".pdf"),
+      width = 8.2, height = 5.5)
+  par(oma = c(0, 0, 0, 0), mar = c(0, 0, 0, 0), mgp = c(-1.5, 0, 0))
+    mig_flow <- temp_k[, c("origin", "dest", my_est_names)]
+  names(mig_flow)[3] <- "y"
+  y <- mig_flow$y
+  index_o <- mig_flow$origin
+  index_d <- mig_flow$dest
+plot(st_geometry(bb_asia), border = "white",  asp = 1,
+     ylab = ifelse(k == 1, year_k, ""))
+plot(st_geometry(contours2), border = "white", 
+     col = "lightgrey", lwd = 0.1, asp = 1.,
+     xlab = year_k, add = T)
+
+  # plot(st_geometry(world_union), border = rgb(0.4, 0.4, 0.4), add = T)
+  plot_flows_unique(
+    y, # value of the flow
+    index_o = as.character(index_o), # label of the origin
+    index_d = as.character(index_d),  # label of the destination
+    geo_site = contours2,  # the geographic coordinates of the sites: polygon or points of class sf
+    column_name = "S", # the column name of the regions in geo_site sf object and/or in xy_sf
+    add = T,   # if add = T, the arcs and only the arcs will printed on the existing device
+    type = "barchart", # if T plot barplot for outloflows/inflows and intra flows
+    xy_sf = xy_sf2, # possibility to give different coordinates of the starting and ending flows (by default, it corresponds to the centroid of geo_site)
+    select_o = NULL, # the origin sites to print
+    select_d = NULL, # the destination site to print
+    select_bar = countries_as, # the sites to print the barplot
+    select_flows =NULL, # a vector of logical of size N indicating the flows to be printed
+    col_site = NULL, # a vector of colors with attribute names equal to the name of the sites
+    transparency = list(alpha = c(0.3, 0.6, 1), 
+                      range = c(0, 300000, max(y))), # two scalars to define the values of the minimum and maximum transparency
+    width_arc = c(0.15, max_y), # a flow equals to max(flows) is represented by an arc of width 1 
+    size_head_arc = 1, # the size of the ending and starting of the arrows
+    reduce_arc = 1.2, # the percentage of reduction of the flow
+    percent_arc = 0.05, # the percentage of flows to represent
+    width_bar = 0.95, # the width of the barplot
+    lwd_bar = 0.1,   # the lwd of the bar
+    percent_bar = 1, # the percentage of barplot to print
+    col_direction = "outflows", # a character among "outflows", "inflows", "none"; by default, the outflows will be plotted in color
+    col_geometry = "lightgrey",  # color inside the polygons
+    border_geometry = "white", # color of the contours 
+    lwd_geometry = 0.5, # width of the contours,
+    print_names = F, # print the names of the sites on the map
+    size_names = 1, # size of the names if printed
+    print_legend = ifelse(year_k == "2015-2020", T, F), # legend for the width of the flows
+    pos_legend = "bottomleft", # position of the legend
+    values_legend = c(100000, 200000, 500000), # values of the flows to be printed on the legend
+    size_legend = 0.7, # size of the characters in the legend
+    horiz_legend = F, # by default vertical
+    title_legend = "Flows", # the name of the legend
+    digit_legend = 2, # number of digits to keep in legend
+    bezier = F
+    )
+  if (year_k == "2015-2020") {
+    x_start <- -4 * 10^6
+    y_start <- -7*10^6
+    lines(x_start + c(0, 500000), c(y_start, y_start), lwd = 3)
+    text(x_start + 250000, y_start, "500 km", pos = 3, cex = 0.8)
+  }
+    dev.off()
+  }
+}
+```
+

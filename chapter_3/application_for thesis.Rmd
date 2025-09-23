@@ -1,0 +1,1732 @@
+---
+title: "Application to Migration Flows"
+author: Thibault Laurent
+date: "`r Sys.Date()`"
+output :
+  rmdformats::html_clean:
+    toc: true
+    number_sections: yes
+    fig_caption: true
+    template: flatly
+    code_folding: hide
+  pdf_document:
+    number_sections: yes
+    toc: yes
+    toc_depth: 2
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This document provides the R code used to reproduce the results presented in Chapter 3 of Thibault Laurent’s thesis.  
+While the theoretical framework is based on the original article, the empirical application has been adapted and extended in this chapter to focus on international migration flows.  
+The present supplementary material concentrates exclusively on the application, offering the scripts and comments needed to replicate the results.
+Note that the supplementary material of the original article is available here : https://github.com/tibo31/spatial_coda_elasticities
+
+
+
+List of required packages:
+```{r, message = F, eval = F}
+devtools::install_github('rensa/ggflags')
+```
+
+
+```{r, message = FALSE}
+source("codes/corrplot.R")
+# Visualization and color palettes
+library(colorspace)   # advanced color palettes
+library(ggridges)     # ridge plots for distributions
+library(ggstance)     # horizontal variants of ggplot geoms
+library(ggflags)      # country flags for ggplot
+library(tidytext)
+library(forcats)
+
+# Spatial data and econometrics
+library(sf)           # handling spatial vector data
+library(spdep)        # spatial econometrics and spatial weights
+
+# Data manipulation and plotting
+library(tidyverse)    # data wrangling and visualization framework
+
+# Correlation visualization
+library(corrplot)     # correlation matrix plots
+
+# Correspondance between iso3 and country names
+library(countrycode)
+```
+
+# Data preparation
+
+## Migration flows
+
+We use bilateral migration flows estimated with the optimal transport method, as introduced in Chapter 1 of the thesis.  
+For this application, the analysis is restricted to a single period (2020–2024) and covers 230 countries and territories.  
+
+To capture persistence in migration dynamics, we also include flows from the previous period.  
+Past migration patterns are known to influence current ones through established networks, lower informational and transaction costs, and the presence of diasporas in destination countries.  
+Incorporating this dynamic component helps provide a more comprehensive understanding of the structural mechanisms driving international migration.  
+
+```{r}
+my_years <- c(1990, 1995, 2000, 2005, 2010, 2015, 2020, 2024)
+l <- 7
+start_period <- my_years[l]
+end_period <- my_years[l + 1]
+period_of_interest <- paste0(start_period, "-", end_period) 
+# our estimates
+load("data/our_estimates_2024.RData")
+pairs_od <- our_estimates_5y %>%
+  filter(year == period_of_interest,
+         type == "tot") %>%
+  mutate(y = hat_transport_open_outwards + 
+           hat_transport_open_returns + 
+           hat_transport_open_transits) %>%
+  select(origin, dest, y) %>%
+  rename(cont_o = origin,
+         cont_d = dest) 
+
+pairs_od_2 <- our_estimates_5y %>%
+  filter(year == paste0(my_years[l-1], "-", my_years[l]) ,
+         type == "tot") %>%
+  mutate(y = hat_transport_open_outwards + 
+           hat_transport_open_returns + 
+           hat_transport_open_transits) %>%
+  select(origin, dest, y) %>%
+  rename(cont_o = origin,
+         cont_d = dest,
+         y_1 = y) 
+
+pairs_od <- merge(pairs_od, pairs_od_2, by = c("cont_o", "cont_d"))
+row.names(pairs_od) <- paste0(pairs_od$cont_o,
+                              "-", pairs_od$cont_d)
+unique_iso3 <- unique(c(pairs_od$cont_o, pairs_od$cont_d))
+```
+
+
+## Climate data
+
+We rely on the climate indicators introduced in Chapter 2, constructed at the country level and aggregated over five-year periods.  
+For this application, the data are aggregated from the beginning of the observation window (`r start_period`) to its end (`r end_period`).  
+
+The indicators capture deviations from long-term climatic norms, the persistence of wet and dry conditions, and the frequency, duration, and intensity of extreme events.  
+Although we prepare the full set of climatic variables described in Chapter 2, in this application we focus on two key indicators: heatwave frequency (HWF) and dry spells (Dry).  
+
+
+```{r}
+load("data/final_indicator.RData")
+final_indicator[, "t2m_diff"] <- apply(st_drop_geometry(final_indicator)[, paste0("t2m_diff_", start_period:(end_period - 1))], 1, mean)
+final_indicator[, "prec_diff"] <- apply(st_drop_geometry(final_indicator)[, paste0("prec_diff_", start_period:(end_period - 1))], 1, mean)
+final_indicator[, "ghwr_35"] <- apply(st_drop_geometry(final_indicator)[, paste0("ghwr_35_", start_period:(end_period - 1))], 1, mean)
+final_indicator[, "P5D"] <- apply(st_drop_geometry(final_indicator)[, paste0("prec_5days_", start_period:(end_period - 1))], 1, mean)
+final_indicator[, "dry"] <- apply(st_drop_geometry(final_indicator)[, paste0("dry_",start_period:(end_period - 1))], 1, mean)
+final_indicator[, "wet"] <- apply(st_drop_geometry(final_indicator)[, paste0("wet_", start_period:(end_period - 1))], 1, mean)
+
+final_indicator[, "wsdi"] <- apply(st_drop_geometry(final_indicator)[, paste0("E_wsdi_upp_", start_period:(end_period - 1))], 1, mean)
+final_indicator[, "wsd"] <- apply(st_drop_geometry(final_indicator)[, paste0("E_wsd_upp_", start_period:(end_period - 1))], 1, max)
+final_indicator[, "wsei"] <- apply(st_drop_geometry(final_indicator)[, paste0("E_wsei_upp_", start_period:(end_period - 1))], 1, mean)
+final_indicator[, "csdi"] <- apply(st_drop_geometry(final_indicator)[, paste0("E_wsdi_low_", start_period:(end_period - 1))], 1, mean)
+final_indicator[, "csd"] <- apply(st_drop_geometry(final_indicator)[, paste0("E_wsd_low_", start_period:(end_period - 1))], 1, max)
+final_indicator[, "csei"] <- apply(st_drop_geometry(final_indicator)[, paste0("E_wsei_low_", start_period:(end_period - 1))], 1, mean)
+final_indicator[, "hwf"] <- apply(st_drop_geometry(final_indicator)[, paste0("E_hwf_upp_", start_period:(end_period - 1))], 1, mean)
+final_indicator[, "hwd"] <- apply(st_drop_geometry(final_indicator)[, paste0("E_hwd_upp_", start_period:(end_period - 1))], 1, max)
+final_indicator[, "hwei"] <- apply(st_drop_geometry(final_indicator)[, paste0("E_hwei_upp_", start_period:(end_period - 1))], 1, mean)
+final_indicator[, "cwf"] <- apply(st_drop_geometry(final_indicator)[, paste0("E_hwf_low_", start_period:(end_period - 1))], 1, mean)
+final_indicator[, "cwd"] <- apply(st_drop_geometry(final_indicator)[, paste0("E_hwd_low_", start_period:(end_period - 1))], 1, max)
+final_indicator[, "cwei"] <- apply(st_drop_geometry(final_indicator)[, paste0("E_hwei_low_", start_period:(end_period - 1))], 1, mean)
+
+nom_vars <- c("t2m_diff", "prec_diff", "ghwr_35", "P5D", "dry", "wet", 
+              "wsdi", "wsd", "wsei", 
+              "csdi", "csd", "csei", 
+              "hwf", "hwd", "hwei",
+              "cwf", "cwd", "cwei")
+
+temp <- st_drop_geometry(
+  final_indicator[final_indicator$iso3 %in% unique_iso3, ])
+
+my_X <- temp[, c("iso3", nom_vars)]
+```
+
+
+## Natural disaster data
+
+In addition to conflict-related shocks, we also incorporate information on natural disasters using the **EM-DAT** database maintained by the Centre for Research on the Epidemiology of Disasters (CRED) (Guha-Sapir et al., 2015).  
+The EM-DAT database provides global, systematic, and standardized records of natural and technological disasters, including information on the type of event (e.g., floods, droughts, earthquakes, storms), its location, timing, and associated human and economic impacts.  
+
+For this application, we focus on the variable **`Total Affected`**, which aggregates the number of individuals injured, made homeless, or otherwise requiring immediate assistance following a disaster. This measure is particularly relevant because it captures the overall human impact of disasters, beyond fatalities alone, and therefore provides a better proxy for potential migration pressures.  
+
+By combining conflict and disaster data, we account for both violent and environmental shocks that may influence migration dynamics, either by directly displacing populations or by affecting long-term living conditions.  
+
+
+
+```{r, eval = F}
+natural <- readxl::read_xlsx("data/public_emdat_custom_request_2025-03-04_0bfb4e4c-60c3-4bec-b9a7-e533bd2e3945.xlsx")
+natural <- natural %>%
+  filter(`Start Year` %in% start_period:(end_period - 1))
+iso3_nat <-  natural$ISO
+
+natural <- as.data.frame(natural[, 
+    -c(1, 2, 3, 6, 7, 8, 9, 10, 11, 14, 15, 16, 23, 24, 25, 26:31, 43:46)])
+
+for(k in 1:ncol(natural)) {
+  if(class(natural[[k]]) == "character")
+    natural[[k]] <- factor(natural[[k]])
+}
+
+natural <- missForest::missForest(natural)
+natural_imp <- natural$ximp
+
+natural <- aggregate(natural_imp$`Total Affected`, 
+                    by = list(ISO3 = iso3_nat),
+                    FUN = sum, na.rm = T)
+names(natural) <- c("iso3", "nat_dis")
+save(natural, file = "data/natural.RData")
+```
+
+```{r}
+load("data/natural.RData")
+natural$Lnat_dis <- log(1 + natural$nat_dis)
+# merge natural
+my_X <- merge(my_X, natural, by = "iso3", all.x = T)
+```
+
+
+## Conflict data
+
+Since some migration flows may be driven by conflict-related events, we incorporate data from the **Armed Conflict Location & Event Data Project (ACLED)**, a widely used source on political violence and protest events (Raleigh et al., 2010).  
+From this dataset, we use the variable **fatalities**, which records the number of reported deaths associated with each conflict or protest event. We aggregate this variable at the country level over the observation period in order to capture the intensity of violence and its potential influence on migration flows.  
+
+
+```{r, warning = F}
+conflict <- read.csv('data/1997-01-01-2024-06-30.csv')
+conflict$event_date <- as.Date(conflict$event_date,
+                               format = c("%d %B %Y"))
+conflict <- conflict %>%
+  filter(conflict$event_date > paste0(start_period, "-06-01") & 
+           conflict$event_date < paste0(end_period, "-06-01"))
+conflict$fatalities <- as.numeric(conflict$fatalities)
+conflict_period <- aggregate(conflict[, c("fatalities")],
+                             by = list(country = conflict$country),
+                             FUN = sum, na.rm = T)
+
+conflict_period$iso3 <- countrycode::countrycode(conflict_period$country, 
+                                                  "country.name", "iso3c")
+# categorized 
+conflict_period$class_conflict <- findInterval(conflict_period$x, 
+                        c(0, 50, 1000, 10000, 1000000), all.inside = TRUE)
+
+# merge conflict 
+my_X <- merge(my_X, conflict_period[, c("iso3", "class_conflict")],
+              by = "iso3", all.x = T)
+# fill missing
+my_X[is.na(my_X$class_conflict), "class_conflict"] <- c(2, 1, 1, 1, 1, 1, 1)
+# discretize the variable
+my_X$class_conflict <- c(c("low", "medium", "high", "very high"))[my_X$class_conflict]
+```
+
+
+## Political stability and human development
+
+To further account for structural drivers of migration, we include measures of political stability and human development.  
+First, we use the **Political Stability and Absence of Violence/Terrorism** index from the **World Development Indicators (WDI)** published by the World Bank (World Bank, 2025). This indicator reflects perceptions of the likelihood that a government will be destabilized or overthrown by unconstitutional or violent means, including politically motivated violence and terrorism. It provides a relevant proxy for the institutional and security environment in origin and destination countries.  
+
+Second, we rely on the **Human Development Index (HDI)** as reported in the **Human Development Report 2025 Statistical Annex** (UNDP, 2025). The HDI is a composite measure that captures average achievements in three key dimensions of human development: health (life expectancy at birth), education (mean years of schooling and expected years of schooling), and standard of living (gross national income per capita). We use it as a broad measure of socio-economic conditions that may shape migration decisions and opportunities.  
+
+
+```{r, warning = F, message = F}
+wb <- read.csv("data/6fa98486-1b47-4578-8979-58b9491e024d_Data.csv")
+
+noms_var <- "politicalstability"
+temp <- wb[wb$Series.Code == "PV.EST", -c(1, 2, 3)]
+names(temp)[-1] <- c("1990-1995", "1995-2000", "2000-2005", "2005-2010",
+                          "2010-2015", "2015-2020", "2020-2024")
+political <- pivot_longer(temp, cols = 2:8, names_to = "period", 
+                          values_to = noms_var) %>%
+    filter(period == period_of_interest)
+political[[noms_var]] <- as.numeric(political[[noms_var]] )
+names(political)[1] <- "iso3"  
+
+hdi <- readxl::read_xlsx("data/HDR25_Statistical_Annex_HDI_Table.xlsx",
+                         skip = 7) %>%
+  rename(num = 1, country = 2, HDI = 3) %>%
+  filter(!is.na(num)) %>%
+  select(2, 3) 
+hdi$HDI <- as.numeric(hdi$HDI)
+hdi$iso3 <- countrycode::countrycode(hdi$country, "country.name", "iso3c")
+unique_iso3[!(unique_iso3 %in% hdi$iso3)]
+hdi_b <- read.csv("data/hdi_proxies_missing_un.csv") 
+hdi_b <- hdi_b[, c("name", "hdi", "iso3")] 
+names(hdi_b) <- c("country", "HDI", "iso3")
+hdi <- rbind(hdi, hdi_b)
+hdi <- hdi[, -1]
+
+# merge political stability
+my_X <- merge(my_X, political[, c("iso3", noms_var)], by = "iso3", all.x = T)
+# Merge HDI
+my_X <- merge(my_X, hdi, by = "iso3",  all.x = T)
+```
+
+## Population and GDP
+
+We use World Bank World Development Indicators (WDI) to retrieve data on GDP per capita (PPP), population, and unemployment for all countries and territories over 2020–2023. Missing or unreliable values are complemented with manual estimates and imputations (e.g., using parent economies for territories), in order to obtain a consistent dataset covering the 230 units in the migration analysis.
+
+```{r, eval = F}
+# install.packages(c("wbstats","dplyr","readr"))
+library(wbstats)
+library(dplyr)
+library(readr)
+
+# 1) Liste cible
+iso3_list <- unique_iso3  # raccourci
+
+# 2) Indicateurs à récupérer
+indicators <- c(
+  gdp_ppp      = "NY.GDP.PCAP.PP.CD",       # PPP courant
+  population   = "SP.POP.TOTL",
+  unemployment = "SL.UEM.TOTL.ZS",          # chômage (%)
+  gdp_growth   = "NY.GDP.PCAP.KD.ZG"        # croissance PIB/hab
+)
+
+# 3) Télécharger les données (2020–2023)
+wb_data_all <- wb_data(
+  country     = iso3_list,
+  indicator   = indicators,
+  start_date  = start_period,
+  end_date    = end_period - 1,
+  return_wide = FALSE
+)
+
+# 4) Moyenne par pays
+wb_summary <- wb_data_all %>%
+  group_by(iso3c, indicator) %>%
+  summarise(value_avg = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = indicator, values_from = value_avg) %>%
+  rename(GDP =  `GDP per capita, PPP (current international $)`,
+         pop = `Population, total`,
+         unemp = `Unemployment, total (% of total labor force) (modeled ILO estimate)`) %>%
+  select(iso3c, GDP, pop, unemp)
+
+# -- Estimations manuelles (valeurs « raisonnables » 2020–2024, Intl$)
+# Remplace/actualise facilement ces nombres si tu as de meilleures sources.
+manual_estimates <- c(
+  "LIE" = 139100,
+  "MCO" = 115700,
+  "SSD" = 1700,  # Sud-Soudan (conflit/famine -> très bas)
+  "ERI" = 1900,  # Erythrée
+  "YEM" = 2000,  # Yémen
+  "PRK" = 1500,  # Corée du Nord (ordre de grandeur)
+  "SOM" = 1450,  # Somalie
+  "CUB" = 21000, # Cuba (ordre de grandeur PPP)
+  "VEN" = 8400   # Venezuela (post-crise, PPP par hab.)
+)
+
+wb_summary[sapply(names(manual_estimates), function(x) grep(x, wb_summary$iso3c)), "GDP"] <- manual_estimates
+
+manual_df <- tibble(
+  iso3c = names(manual_estimates),
+  GDP = as.numeric(manual_estimates),
+  n_years = 0L
+)
+
+# -- Mapping territoires -> économie « parente » (imputation par copie)
+parent_map <- c(
+  "ASM" = "USA", # American Samoa -> USA
+  "GIB" = "GBR", # Gibraltar -> Royaume-Uni
+  "GUM" = "USA", # Guam -> USA
+  "IMN" = "GBR", # Isle of Man -> Royaume-Uni (proche)
+  "NCL" = "FRA", # Nouvelle-Calédonie -> France
+  "MNP" = "USA", # Northern Mariana Islands -> USA
+  "PYF" = "FRA", # Polynésie française -> France
+  "VGB" = "GBR"  # British Virgin Islands -> Royaume-Uni
+)
+
+parent_df <- tibble(iso3c = names(parent_map),
+                    parent_iso3 = unname(parent_map)) %>%
+  left_join(wb_summary %>% select(parent_iso3 = iso3c,
+                                parent_ppa = GDP),
+            by = "parent_iso3") %>%
+  transmute(iso3c,
+            GDP = parent_ppa,
+            n_years = -1L)  # code -1 pour signaler une imputation « parente »
+wb_summary[sapply(parent_df$iso3c, function(x) grep(x, wb_summary$iso3c)), "GDP"] <- parent_df$GDP
+
+# estimation du chomage 
+manual_estimates <- c(
+  "ABW" = 3.9,
+  "AND" = 1.5,
+  "ASM" = 5,
+  "ATG" = 8,
+  "BMU" = 4,
+  "CUW" = 7,
+  "CYM" = 3,
+  "DMA" = 8,  
+  "FRO" = 2,
+  "FSM" = 11,
+  "GIB" = 3,
+  "GRD" = 21,
+  "GRL" = 5,
+  "IMN" = 0.7,
+  "KIR" = 5,
+  "KNA" = 25, 
+  "LIE" = 1,
+  "MCO" = 2,
+  "MHL" = 6,
+  "MNP" = 10,
+  "NRU" = 10,
+  "PLW" = 5,
+  "SMR" = 4,
+  "SXM" = 8,
+  "SYC" = 6,
+  "TCA" = 11,
+  "TUV" = 1,
+  "VGB" = 6.2)
+wb_summary[sapply(names(manual_estimates), function(x) grep(x, wb_summary$iso3c)), "unemp"] <- manual_estimates
+
+# j'ajoute les manquants 
+aux_estimates <- tribble(
+  ~iso3c, ~pop, ~GDP, ~unemp, 
+  "AIA",  16e3, 22000,  5,  
+  "COK",  17e3, 22000,  8,  
+  "FLK", 3.6e3, 55000,  4,  
+  "GUF", 300e3, 27000, 20,  
+  "GLP", 380e3, 27000, 19,  
+  "MTQ", 360e3, 27000, 17,  
+  "MYT", 320e3, 10000, 25,  
+  "MSR",   5e3, 13000,  6, 
+  "NIU",  1.6e3, 17000, 12, 
+  "REU", 870e3, 27000, 21,  
+  "SHN",  5.6e3, 15000, 14, 
+  "SPM",    6e3, 39000, 11, 
+  "TKL",  1.5e3,  6000, 20, 
+  "WLF",   11e3,  9000, 12, 
+  "ESH", 600e3,  3000, 25, 
+  "TWN", 23300000, 33000, 3.8
+) %>%
+  mutate(
+    # Optionnel : arrondis pour éviter de fausses précisions
+    pop = round(pop),
+    GDP = round(GDP, 0),
+    unemp = round(unemp, 1)
+  )
+wb_summary <- rbind(wb_summary, aux_estimates)
+save(wb_summary, file = "data/GDP.RData")
+```
+
+```{r}
+load("data/GDP.RData")
+wb_summary$LGDP <- log(wb_summary$GDP)
+wb_summary$Lpop <- log(wb_summary$pop)
+wb_summary$Lunemp <- log(wb_summary$unemp)
+my_X <- merge(my_X, wb_summary, by.x = "iso3", by.y = "iso3c") 
+```
+
+
+
+## Imputation of missing values
+
+A few observations were missing for the HDI, political stability, and natural disaster variables.  
+To address this issue, we applied the **Random Forest–based imputation algorithm** implemented in the `missForest` package (Stekhoven & Bühlmann, 2012).  
+This method iteratively predicts missing entries using ensembles of decision trees and is well suited for mixed data types (continuous and categorical).  
+
+Compared to simpler approaches such as mean substitution or linear interpolation, random forest imputation preserves the multivariate structure of the data and reduces the risk of bias. This is particularly important in our setting, as the missingness is not systematic and the relationships between explanatory variables may be nonlinear.
+
+```{r}
+numeric_vars <- sapply(my_X, is.numeric)
+vars_with_missing <- sapply(my_X, function(x) any(is.na(x)))
+# fill missing values
+temp_imp <- missForest::missForest(my_X[, numeric_vars])$ximp
+my_X[, names(which(vars_with_missing))] <- temp_imp[, names(which(vars_with_missing))]
+```
+
+
+## Spatially lagged variables  
+
+We include spatially lagged variables to account for potential spillover effects across countries. To this end, we first construct a spatial weights matrix based on the 5 nearest neighbors of each country. In addition, we build an alternative matrix using the 10 nearest neighbors, which serves as a robustness check in the empirical analysis.  
+
+To construct these neighbors, we rely on the geographical database developed by **James (2025)**, which provides harmonized measures of distances and contiguity for all recognized countries and territories. This dataset ensures consistency with international standards and is widely used in empirical studies of international trade and migration.  
+
+
+```{r}
+my_proj <- '+proj=robin +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs'
+source(file = "data/Load_Geospatial_Data.R")
+sf_use_s2(F)
+world_sf <- GeoDATA %>%
+  rename(region = SIREGION, iso3 = ISO3)
+countries_regions <- world_sf %>%
+  rmapshaper::ms_simplify(, keep = 0.05, keep_shapes = T)
+# polygons with same country than UN data basis
+world <- st_transform(countries_regions, my_proj)
+world_union <- st_union(world)
+
+# contours, longitude and latitude of the map
+p1 <- rbind(c(-180, -90), 
+            c(180, -90),
+            cbind(180, seq(-90, 90, by = 1)),
+            c(180, 90),
+            c(-180, 90),
+            cbind(-180, seq(90, -90, by = -1)),
+            c(-180, -90))
+border_sf <- st_sfc(st_polygon(list(p1)))
+long_sf <- st_sfc(st_linestring(cbind(-150, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(-120, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(-90, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(-60, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(-30, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(0, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(150, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(120, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(90, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(60, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(30, seq(-90, 90, by = 1)))
+)
+lat_sf <- st_sfc(st_linestring(cbind(seq(-180, 180, by = 1), -60)),
+                  st_linestring(cbind(seq(-180, 180, by = 1), -30)),
+                  st_linestring(cbind(seq(-180, 180, by = 1), -0)),
+                  st_linestring(cbind(seq(-180, 180, by = 1), 30)),
+                  st_linestring(cbind(seq(-180, 180, by = 1), 60))
+)
+# Coordinate Reference System
+st_crs(border_sf) <- 4326
+st_crs(long_sf) <- 4326
+st_crs(lat_sf) <- 4326
+border_sf <- st_transform(border_sf, my_proj)
+long_sf <- st_transform(long_sf, my_proj)
+lat_sf <- st_transform(lat_sf, my_proj)
+sea <- st_difference(border_sf, world_union)
+
+# create area
+world_iso <- world[world$iso3 %in% unique(pairs_od$cont_o), ]
+world_iso$SMALL_AREA <- ifelse(world_iso$AREA < 10000, "yes", "no")
+```
+
+
+
+Figure 3.6 in the chapter illustrates the spatial network linking the 230 countries and territories in our dataset, with each unit connected to its designated set of neighbors.  
+
+
+```{r}
+world_iso_3 <- merge(world_iso, my_X, by = "iso3")
+world_iso_3_agg <- world_iso_3
+world_iso_3_agg$iso3[world_iso_3_agg$iso3 == "ESH"] <- "MAR"
+world_iso_3_agg <- aggregate(world_iso_3_agg[, "iso3"], 
+          by = list(iso3 = world_iso_3_agg$iso3),
+          FUN = length)
+# fontiere Maroc / Sahara 
+frontiers <- st_intersection(world_iso_3[world_iso_3$iso3 == "MAR", ], 
+                world_iso_3[world_iso_3$iso3 == "ESH", ])
+```
+
+```{r, fig.width = 10, fig.height = 5, warning = F}
+my_centroid <- st_as_sf(data.frame(
+  long = world_iso_3$Centroid_of_LARGEST_POLYGON_X,
+  lat = world_iso_3$Centroid_of_LARGEST_POLYGON_Y,
+  iso3 = world_iso_3$iso3),
+  coords = c("long", "lat"),
+  crs = 4326)
+
+# based on contiguity + 3 neighbours
+nb_out <- union.nb(poly2nb(world_iso_3),
+                   knn2nb(knearneigh(my_centroid, k = 3)))
+# based on 10 neighbours
+out <- knearneigh(my_centroid, k=10)
+nb_out_10 <- knn2nb(out)
+
+OW <- nb2mat(nb_out)
+
+crs_robin <- st_crs(world_iso_3)
+neighbours_sf <- st_as_sf(nb2lines(nb_out,
+            coords =  st_coordinates(st_centroid(world_iso_3))))
+st_crs(neighbours_sf) <- crs_robin
+long_sf_180 <- st_sfc(st_linestring(cbind(-180, seq(-90, 90, by = 1))),
+                  st_linestring(cbind(180, seq(-90, 90, by = 1))),
+                  crs = 4326
+)
+long_sf_180 <- st_transform(long_sf_180, crs_robin)
+
+ind_big <- which(as.numeric(st_length(neighbours_sf)) > 10^7)
+
+#pdf("figures/spatial_weight.pdf", width = 10, height =5)
+par(oma = c(0, 0, 0, 0), mar = c(0, 0, 0, 0))
+plot(st_geometry(world_iso_3_agg), border = "lightgrey",
+     ylim = c(-7*10^6, 7*10^6))
+plot(st_geometry(frontiers), add = T, col = "lightgrey",
+     lty = 3)
+plot(st_geometry(sea), col = "lightblue", add = T)
+plot(st_geometry(neighbours_sf[-ind_big, ]), col = "darkred",
+     add =T, lwd = 0.8)
+
+for(l in 1:length(ind_big)) {
+   
+# point 1
+x_pt_1 <- neighbours_sf[ind_big[l], ]$geometry[[1]][1, 1]
+y_pt_1 <- neighbours_sf[ind_big[l], ]$geometry[[1]][1, 2]
+pt_1 <- st_sfc(st_point(c(x_pt_1, y_pt_1)), crs = crs_robin)
+# point 2
+x_pt_2 <- neighbours_sf[ind_big[l], ]$geometry[[1]][2, 1]
+y_pt_2 <- neighbours_sf[ind_big[l], ]$geometry[[1]][2, 2]
+pt_2 <- st_sfc(st_point(c(x_pt_2, y_pt_2)), crs = crs_robin)
+
+seg1 <- st_nearest_points(pt_1, long_sf_180[which.min(as.numeric(st_distance(pt_1, long_sf_180))), ])  
+seg2 <- st_nearest_points(pt_2, long_sf_180[which.min(as.numeric(st_distance(pt_2, long_sf_180))), ])  
+plot(st_geometry(seg1), add = T, col = "darkred")
+plot(st_geometry(seg2), add = T, col = "darkred")
+}
+#dev.off()
+```
+
+We construct spatially lagged versions of the $OX/DX$ variables, capturing the influence of neighboring countries’ characteristics.  
+
+```{r}
+my_X <- st_drop_geometry(world_iso_3)
+
+climate_var <- c("t2m_diff",  "prec_diff", "ghwr_35", "P5D",  
+                 "dry", "wet",  "wsdi", "wsd",  "wsei",  "csdi",  
+                 "csd", "csei", "hwf",  "hwd", "hwei", "cwf", "cwd", 
+                 "cwei", "nat_dis", "Lnat_dis")
+other_var <- c("politicalstability", "HDI", "LGDP", "Lpop", "Lunemp")
+
+for(k in c(climate_var, other_var)) {
+  my_X[, paste0("Lag_", k)] <- lag.listw(nb2listw(nb_out), my_X[, k])
+}
+save(my_X, file = "data/covariates.RData")
+```
+
+
+### Linguistic and colonial attributes
+
+To characterize bilateral migration flows, we use dyadic variables from CEPII datasets.  
+The **GeoDist** database provides information on languages and colonial ties (Mayer & Zignago, 2011).  
+The **Gravity** dataset complements this by including a broader set of bilateral covariates, such as cultural, colonial, linguistic, and geographical links (Head, Mayer & Ries, 2022).  
+
+These attributes help capture historical and cultural relationships between origin and destination countries.  
+
+
+
+```{r}
+geo <- readxl::read_xls("data/geo_cepii.xls",
+                        sheet = "geo_cepii", skip = 0)
+cepii2 <- read.csv("data/geo_cepii_gapfilled_subset.csv")
+names(cepii2)[c(3, 13)] <- c("cnum", "lon")
+geo <- rbind(geo, cepii2)
+
+names_lang <- c("langoff_1", "langoff_2", "langoff_3", "lang20_1", "lang20_2", "lang20_3", "lang20_4", "lang9_1", "lang9_2", "lang9_3", "lang9_4")
+names_colony <- c("colonizer1", "colonizer2", "colonizer3", "colonizer4", "short_colonizer1",
+                  "short_colonizer2", "short_colonizer3")
+geo_df <- data.frame(unique(geo[, c("iso3", names_lang, names_colony)]), row.names = "iso3")
+pairs_od[, "comlang"] <- 0
+pairs_od[, "colony"] <- 0
+for(l in 1:nrow(pairs_od)) {
+  pairs_od[l, "comlang"] <- length(setdiff(intersect(
+    as.character(geo_df[pairs_od$cont_o[l], names_lang]),
+    as.character(geo_df[pairs_od$cont_d[l], names_lang])), "."))
+  pairs_od[l, "colony"] <- length(intersect(
+    as.character(row.names(geo_df[pairs_od$cont_o[l], ])),
+    as.character(geo_df[pairs_od$cont_d[l], names_colony])))
+}
+pairs_od[, "comlang"] <- factor(ifelse(pairs_od[, "comlang"] > 0, "yes", "no"),
+                                 levels = c("yes", "no"))
+pairs_od[, "colony"] <- factor(ifelse(pairs_od[, "colony"] > 0, "yes", "no"),
+                                 levels = c("yes", "no"))
+```
+
+
+### Geographical proximity: distances and contiguity
+
+We include two measures of geographical proximity between countries:  
+
+* **Minimum distance**: computed with the `st_distance()` function from the **sf** package, as the shortest distance between national borders. For neighbors, this distance is zero, which better reflects spatial separation than capital-to-capital distances.  
+
+* **Contiguity**: a binary variable equal to 1 if two countries share a border, 0 otherwise.  
+
+Both measures are derived from the harmonized geographical database of **James (2025)**, widely used in trade and migration studies.  
+
+```{r, warning = F, message = F}
+# create distance
+n <- nrow(world_iso_3)
+n_d <- n_o <- n  
+names_o <- names_d <- world_iso_3$iso3
+g_2 <- st_distance(world_iso_3)
+g_2 <- st_distance(st_centroid(world_iso_3, of_largest_polygon = T))
+dimnames(g_2) <- list(names_o, names_d)
+g_2 <- as.vector(t(g_2)) / 1000
+# g_2 <- ifelse(g_2 != 0, log(g_2), 0)  
+names(g_2) <- paste0(rep(names_o, n_d), "-", rep(names_d, each = n_o))
+pairs_od$g <- 0
+pairs_od[names(g_2), "g"] <- g_2
+# plot(log(1 + y) ~ log(1 + g), data = pairs_od)
+# abline(lm(log(1 + y) ~ log(1 + g), data = pairs_od), col = "red")
+
+## contiguity variable
+ctg <- nb2mat(poly2nb(world_iso_3), zero.policy = TRUE, style = "B") 
+dimnames(ctg) <- list(
+  world_iso_3$iso3, 
+  world_iso_3$iso3)
+pairs_od$contig <- 0
+for(l in 1:nrow(pairs_od)) {
+  pairs_od[l, "contig"] <- ctg[pairs_od[l, "cont_o"], pairs_od[l, "cont_d"]]
+}
+pairs_od$contig <- ifelse(pairs_od$contig > 0, "yes", "no")
+```
+
+
+## Merging datasets
+
+We then construct the final dataset by combining all relevant dimensions.  
+It brings together:  
+
+* **Origin-specific variables** (population, GDP, political stability, climate indicators),  
+* **Destination-specific variables** (same indicators at the receiving country), and  
+* **Pairwise variables** (geographical distance, contiguity, common language, colonial links).  
+
+The resulting dataset integrates all covariates needed for the empirical analysis of bilateral migration flows.  
+
+
+```{r}
+my_X <- data.frame(my_X, row.names = "iso3") 
+
+for(k in colnames(my_X)) {
+  pairs_od[, paste0(k, "_O")] <- my_X[pairs_od$cont_o, k]
+  pairs_od[, paste0(k, "_D")] <- my_X[pairs_od$cont_d, k]
+}
+
+pairs_od$IncomeLevel_O <-  factor(pairs_od$IncomeLevel_O, 
+              levels = c("LOW", "LOWER-MIDDLE", "UPPER-MIDDLE", "HIGH"))
+pairs_od$IncomeLevel_D <- factor(pairs_od$IncomeLevel_D, 
+              levels = c("LOW", "LOWER-MIDDLE", "UPPER-MIDDLE", "HIGH"))
+pairs_od$class_conflict_O <- factor(pairs_od$class_conflict_O, 
+              levels = c("low", "medium", "high", "very high"))
+pairs_od$class_conflict_D <- factor(pairs_od$class_conflict_D, 
+              levels = c("low", "medium", "high", "very high"))
+pairs_od$comlang <- factor(pairs_od$comlang, levels = c("no", "yes"))
+pairs_od$colony <- factor(pairs_od$colony, levels = c("no", "yes"))
+pairs_od$contig <- factor(pairs_od$contig, levels = c("no", "yes"))
+pairs_od$SMALL_AREA_O <- factor(pairs_od$SMALL_AREA_O, levels = c("no", "yes"))
+pairs_od$SMALL_AREA_D <- factor(pairs_od$SMALL_AREA_O, levels = c("no", "yes"))
+```
+
+## Summary statistics  
+
+This section provides the R code used to produce the supplementary material presented in Annex C:  
+
+Table C.1:
+```{r}
+pairs_od_without_intra <- pairs_od  %>%
+  filter(y > 0) #cont_o != cont_d) #y > 0) # %>%   filter(CONTINENT_O == "ASIA")
+
+sapply(my_X[, c("hwf", "dry", "politicalstability", 
+             "HDI", "Lpop")], function(x) 
+      paste0(round(mean(x), 2), " & ", round(sd(x), 2), " & ", 
+              round(min(x), 2), " & ",  round(max(x), 2)))
+          
+sapply(pairs_od_without_intra[, c("y_1", "g")], function(x) 
+      paste0(round(mean(log(1 + x)), 2), " & ", round(sd(log(1 + x)), 2), " & ", 
+              round(min(log(1 + x)), 2), " & ",  round(max(log(1 + x)), 2)))
+
+sapply(pairs_od_without_intra[, c("comlang", "colony", "contig")], table)
+table(my_X$class_conflict)
+```
+
+Figures C.1–C.3.:  
+
+```{r}
+### OX/DX variables 
+names_xvar <- c("politicalstability", "HDI", "Lpop", "class_conflict")
+names_title <- c("Political stability index", "Human Development Index",
+                 "Log of population", "Conflict")
+# at origin 
+p_list <- vector("list", 4)
+for(k in 1:length(names_xvar)) {
+  if(k != 4)
+    p_list[[k]] <- ggplot(data = pairs_od_without_intra) +
+      aes(x = !!sym(paste0(names_xvar[k], "_O")), y = log(1 + y)) +
+      geom_point(size = 0.5) +
+      geom_smooth(method = "lm") +
+      xlab(paste0(names_title[k], " (at origin)"))
+  else
+    p_list[[k]] <- ggplot(data = pairs_od_without_intra) +
+      aes(x = !!sym(paste0(names_xvar[k], "_O")), y = log(1 + y)) +
+      geom_boxplot(size = 0.5)  +
+      xlab(paste0(names_title[k], " (at origin)"))
+}  
+
+p <- gridExtra::grid.arrange(p_list[[1]], p_list[[2]], 
+                             p_list[[3]], p_list[[4]], ncol = 4)
+p
+#ggsave(p, filename = paste0("figures/OD_scatter_O.pdf"), 
+#                            width = 16, height = 4)
+
+
+# at destination 
+p_list <- vector("list", 4)
+for(k in 1:length(names_xvar)) {
+  if(k != 4)
+    p_list[[k]] <- ggplot(data = pairs_od_without_intra) +
+      aes(x = !!sym(paste0(names_xvar[k], "_D")), y = log(1 + y)) +
+      geom_point(size = 0.5) +
+      geom_smooth(method = "lm") +
+      xlab(paste0(names_title[k], " (at destination)"))
+  else
+    p_list[[k]] <- ggplot(data = pairs_od_without_intra) +
+      aes(x = !!sym(paste0(names_xvar[k], "_D")), y = log(1 + y)) +
+      geom_boxplot(size = 0.5)  +
+      xlab(paste0(names_title[k], " (at destination)"))
+}  
+
+p <- gridExtra::grid.arrange(p_list[[1]], p_list[[2]], p_list[[3]], p_list[[4]], ncol = 4)
+p
+#ggsave(p, filename = paste0("figures/OD_scatter_D.pdf"), 
+#                            width = 16, height = 4)
+
+#############
+### OX/DX variables 
+p4 <- ggplot(data = pairs_od_without_intra) +
+  aes(x = log(1+y_1), y = log(1 + y)) +
+  geom_point(size = 0.5)  +
+  geom_smooth(method = "lm") +
+  xlab("Log(1 + past flows)")
+
+p5 <- ggplot(data = pairs_od_without_intra) +
+  aes(x = log(1 + g), y = log(1 + y)) +
+  geom_point(size = 0.5) +
+  geom_smooth(method = "lm") +
+  xlab("Log(1 + distance)")
+
+p1 <- ggplot(data = pairs_od_without_intra) +
+  aes(x = colony, y = log(1 + y)) +
+  geom_boxplot(size = 0.5)  +
+  xlab("Shared colonial history")
+
+p2 <- ggplot(data = pairs_od_without_intra) +
+  aes(x = contig, y = log(1 + y)) +
+  geom_boxplot(size = 0.5)  +
+  xlab("Contiguity")
+
+p3 <- ggplot(data = pairs_od_without_intra) +
+  aes(x = comlang, y = log(1 + y)) +
+  geom_boxplot(size = 0.5)  +
+  xlab("Common language")
+
+p <- gridExtra::grid.arrange(p1, p2, p3, p4, p5, ncol = 3)
+ggsave(p, filename = paste0("figures/pairs.pdf"), 
+                            width = 12, height = 8)
+
+# climate
+names_xvar <- c("hwf", "dry")
+names_title <- c("Heat wave frequency",
+                 "Consecutive dry days")
+for(k in 1:length(names_xvar)) {
+p1 <- ggplot(data = pairs_od_without_intra) +
+  aes(x = !!sym(paste0(names_xvar[k], "_O")), y = log(1 + y)) +
+  geom_point(size = 0.5) +
+  geom_smooth(method = "lm") +
+  xlab(paste0(names_title[k], " (at origin)"))
+p2 <- ggplot(data = pairs_od_without_intra) +
+  aes(x = !!sym(paste0("Lag_", names_xvar[k], "_O")), y = log(1 + y)) +
+  geom_point(size = 0.5) +
+  geom_smooth(method = "lm") +
+  xlab(paste0(names_title[k], " (lagged at origin)"))
+p3 <- ggplot(data = pairs_od_without_intra) +
+  aes(x = !!sym(paste0(names_xvar[k], "_D")), y = log(1 + y)) +
+  geom_point(size = 0.5)  +
+  geom_smooth(method = "lm") +
+  xlab(paste0(names_title[k], " (at destination)"))
+p4 <- ggplot(data = pairs_od_without_intra) +
+  aes(x = !!sym(paste0("Lag_", names_xvar[k], "_D")), y = log(1 + y)) +
+  geom_point(size = 0.5)  +
+  geom_smooth(method = "lm") +
+  xlab(paste0(names_title[k], " (lagged at destination)"))
+p <- gridExtra::grid.arrange(p1, p2, p3, p4, ncol = 4)
+# ggsave(p, filename = paste0("figures/", names_xvar[k], ".pdf"), 
+#                            width = 20, height = 5)
+p
+}
+```
+
+
+We plot the correlation plot presented in Figure C.4.
+
+```{r}
+X <- pairs_od_without_intra %>% 
+  mutate(log_y = log(1+y),
+         log_distance = log(1+g),
+         log_past_y = log(1+y_1)) %>%
+  rename(political_O = politicalstability_O,
+         political_D = politicalstability_D,
+         log_pop_O = Lpop_O,
+         log_pop_D = Lpop_D
+         )
+
+# --- 2) Define families and desired order -----------------------------------
+fam_climate  <- c("hwf_O","hwf_D","dry_O","dry_D")
+fam_inst     <- c("political_O","political_D","HDI_O","HDI_D")
+fam_demo     <- c("log_pop_O","log_pop_D", "log_past_y")
+fam_dyadic   <- c("log_distance")
+
+# Put Y first so its row/col are easy to see
+var_order <- c("log_y", fam_climate, fam_inst, fam_demo, fam_dyadic)
+
+# Keep only available columns, in that order
+X <- X[, var_order]
+
+# --- 3) Correlation matrix ---------------------------------------------------
+# Pearson by default; use method = "spearman" if you prefer rank correlations.
+R <- cor(X, use = "pairwise.complete.obs", method = "pearson")
+
+# --- 4) Plot with corrplot (ellipses, diverging colors) ----------------------
+# Color palette
+pal <- colorRampPalette(c("#2166AC","#67A9CF","#D1E5F0","#F7F7F7",
+                          "#FDDAD1","#EF8A62","#B2182B"))
+
+# Make Y label stand out (black), others grey
+tl_cols <- c("black", rep("#1B9E77", 4),
+              rep("#D95F02", 4),
+              rep("#7570B3", 3),
+              rep("#E7298A", 1))
+
+# Open plotting device
+# pdf("figures/corr.pdf", width = 7, height =6)
+op <- par(no.readonly = TRUE); on.exit(par(op))
+corrplot(R,
+  method = "ellipse",
+  type = "upper",
+  diag = FALSE,
+  col = pal(200),
+  tl.col = tl_cols,
+  tl.srt = 45,
+  tl.cex = 0.8,
+  addgrid.col = "grey90",
+  mar = c(0,0,.2,0),
+  number.cex = 0.7,
+  # uncomment next line to print coefficients on the ellipses
+  # addCoef.col = "black",
+  cl.ratio = 0.2, cl.align.text = "l"
+)
+
+
+# --- 5) Emphasize Y's row/column --------------------------------------------
+p <- ncol(R)
+iy <- match("log_y", colnames(R))
+# Outline the Y row/column
+rect(xleft = 1.5, ybottom = p - iy + 1.5, xright = p + 0.5, ytop = p - iy + 0.5,
+       border = "black", lwd = 2)
+segments(x0 = 5.5, x1 = p + 0.5, y0 = 8.5, y1 = 8.5, lwd = 2, lty = 2)
+segments(x0 = 9.5, x1 = p + 0.5, y0 = 4.5, y1 = 4.5, lwd = 2, lty = 2)
+
+segments(x0 = 5.5, x1 = 5.5, y0 = 12.5, y1 = 13.5, lwd = 2, lty = 2)
+segments(x0 = 9.5, x1 = 9.5, y0 = 12.5, y1 = 13.5, lwd = 2, lty = 2)
+segments(x0 = 12.5, x1 = 12.5, y0 = 12.5, y1 = 13.5, lwd = 2, lty = 2)
+#dev.off()
+```
+
+
+## Visualization
+
+Here we display the covariates on the same maps used for the migration flows, allowing a direct visual comparison between explanatory factors and observed movements.
+```{r}
+source("codes/plot_flows_unique.R")
+title_var <- c("Difference from \n average T2M temp. (in degree C)", 
+               "Difference from \n average precipitation (in mm)",
+               "GWHR",
+               "Maximum consecutive \n 5-days precipitation (in mm)",
+               "Total Count of Dry Days", 
+               "Total Count of Wet Days",
+               "Annual count of days \n satisfying the warm spell risk",
+               "Length of the longest \n warm spell risk",
+               "Daily maximum \n temperature excess (upp) risk",
+               "Annual count of days \n satisfying the heat wave risk",
+               "Length of the longest \n heat wave risk",
+               "Daily mean temperature \n excess (upp) risk", 
+               "Annual count of days \n satisfying the cold spell risk",
+               "Length of the longest \n cold spell risk",
+               "Daily maximum temperature \n excess (low) risk",
+               "Annual count of days \n satisfying the warm wave risk",
+               "Length of the longest \n warm wave risk",
+               "Daily mean \n temperature excess (low) risk")
+```
+
+## By indicator
+
+```{r, fig.width = 12, fig.height = 7}
+world_3035 <- st_transform(world, 3035) 
+sea_3035 <- st_transform(sea, 3035)
+world_union_3035 <- st_transform(world_union, 3035)
+year_k <- "2020-2024"
+temp_k <- all_estimates %>% 
+    filter(type == "tot", year == year_k)
+# we keep optimal transport estimate 
+mig_flow <- temp_k[, c("origin", "dest", "hat_transport_open")]  %>%
+    filter(hat_transport_open > 2500) 
+names(mig_flow)[3] <- "y"
+y <- mig_flow$y
+index_o <- mig_flow$origin
+index_d <- mig_flow$dest
+
+##
+world_crs <- st_transform(world_iso_3, 3035)
+world_iso_3_agg_3035 <- st_transform(world_iso_3_agg, 3035)
+frontiers_3035 <- st_transform(frontiers, 3035)
+countries_ct <- unique(c(index_o, index_d))
+nom_vars <- c("hwf", "dry", "politicalstability", "HDI", "pop", "class_conflict", "nat_dis")
+title_var <- c("Annual count of days \n satisfying the heat wave risk \n ",
+               "Consecutive dry days",
+               "Political stability",
+               "HDI index",
+               "Population",
+               "Conflict",
+               "Natural disaster"
+               )
+for(l in 1:length(nom_vars)) {
+  
+  # vec_temp <- st_drop_geometry(final_indicator)[, nom_vars[l]]
+  vec_temp <- st_drop_geometry(world_crs)[, nom_vars[l]]
+  if(nom_vars[l] %in% c("politicalstability", "t2m_diff", 
+                        "prec_diff")) {
+    my_mid <- ifelse(nom_vars[l] == "HDI", 0.5, 0)
+    bk_1 <- round(classInt::classIntervals(vec_temp[vec_temp < my_mid], 4,
+                                           "kmeans")$brks, 
+                  digits = 6)
+    bk_2 <- round(classInt::classIntervals(vec_temp[vec_temp >= my_mid], 4,
+                                           "kmeans")$brks, 
+                  digits = 6)
+    bk <- c(bk_1[1:4], my_mid, bk_2[2:5]) 
+    bk[1] <- min(vec_temp)
+    bk[length(bk)] <- max(vec_temp)
+    pal1 <- rev(RColorBrewer::brewer.pal(8, "RdBu"))   
+    if(nom_vars[l] == "politicalstability")
+      pal1 <- rev(pal1)  
+    } else { 
+      if(class(vec_temp) == "numeric") {
+        bk <- round(classInt::classIntervals(vec_temp, 8, "kmeans")$brks, 
+            digits = 6)
+        bk[1] <- min(vec_temp)
+        bk[length(bk)] <- max(vec_temp)
+        pal1 <- RColorBrewer::brewer.pal(8, ifelse(nom_vars[l] %in% 
+                            c("wet", "P5D"), "Blues", "Reds"))
+      }
+    }
+  if(nom_vars[l] == "HDI")
+      pal1 <- RColorBrewer::brewer.pal(8, "Spectral")
+  
+  if(nom_vars[l] == "class_conflict") {
+      bk <- 1:5
+      pal1 <- RColorBrewer::brewer.pal(4, "Reds")
+      ind <- as.numeric(factor(vec_temp, 
+        levels = c("low", "medium", "high", "very high")))
+      
+  } else {
+  ind <- findInterval(vec_temp, bk, all.inside = TRUE)
+  }
+#  pdf(paste0("figures/world_", nom_vars[l], ".pdf"), width = 12, height = 7.7)  # width = 12, height = 6.7)  
+      par(mar = c(0, 0, 1, 0))
+      plot(st_geometry(world_crs), col = pal1[ind], 
+         border = pal1[ind], pch = 15, cex = 0.5, lwd = 0.1,
+         ylim = c(-0.6 * 10^7, 10^7))
+      plot(st_geometry(world_iso_3_agg_3035), border = "lightgrey",  
+           lwd = 0.1, add = T)
+      plot(st_geometry(frontiers_3035), add = T, col = "lightgrey", 
+           lwd = 0.3, lty = 2)
+
+      # title("Consecutive Dry Day in 2024", line = -1.15)
+      #plot(sea_3035, col = scales::alpha("lightblue", 0.3), 
+      #     border = rgb(0.2, 0.2, 0.2), add = T)
+      plot(st_geometry(world_union_3035), add = T, border = rgb(0.2, 0.2, 0.2))
+      #plot(long_sf, add = T, col = "lightgrey")
+      #plot(lat_sf, add = T, col = "lightgrey")
+
+## parameters for legend
+    poly_leg_temp <- vector("list", length(bk) - 1)
+    for(k in 1:(length(bk) - 1)) {
+      poly_leg_temp[[k]] <- rbind(c(14000000, -6300000 + (k - 1) * 750000), 
+         c(14000000 + 1000000, -6300000 + (k - 1) * 750000),
+         c(14000000 + 1000000, -6000000 + (k - 1) * 750000),
+         c(14000000, -6000000 + (k - 1) * 750000),
+         c(14000000, -6300000 + (k - 1) * 750000))
+      if(nom_vars[l] == "class_conflict")
+        poly_leg_temp[[k]][, 2] <- poly_leg_temp[[k]][, 2] + 2800000
+    }
+    poly_leg <- st_sfc(st_polygon(poly_leg_temp[1]))
+    for(k in 2:length(poly_leg_temp)) {
+      poly_leg <- c(poly_leg, st_sfc(st_polygon(poly_leg_temp[k])))
+    }
+    # legend
+    plot(poly_leg, col = pal1, add = T)
+    temp_coord <- st_coordinates(st_centroid(poly_leg))
+    if(nom_vars[l] != "class_conflict") {
+      if(nom_vars[l] %in% c("pop", "nat_dis"))
+        bk_round <- paste0(round(bk/1000000), "M")
+      else
+        bk_round <- round(bk, 2)
+      for(k in 1:length(poly_leg)) {
+        if(k == 1) {
+          my_text <- paste0("<", bk_round[2])
+          } else {
+            if(k == (length(bk) - 1)) {
+              my_text <- paste0(">=", bk_round[length(bk) - 1])
+              } else {
+                my_text <- paste0("[", bk_round[k], "; ", bk_round[k+1], "[")
+              }
+          }
+        text(temp_coord[k, 1], temp_coord[k, 2] + 10, my_text, 
+             pos = 3, cex = 0.7)
+      }
+    } else {
+      my_text <- c("low", "medium", "high", "very high")
+      text(temp_coord[, 1], temp_coord[, 2] + 10, my_text, pos = 3, cex = 0.7) 
+    }
+    text(1.5 * 10^7, -0.01 * 10^7, title_var[l], cex = 0.8)
+
+# plot(st_geometry(world_union), border = rgb(0.4, 0.4, 0.4), add = T)
+plot_flows_unique(
+    y, # value of the flow
+    index_o = as.character(index_o), # label of the origin
+    index_d = as.character(index_d),  # label of the destination
+    geo_site = world_crs,  # the geographic coordinates of the sites: polygon or points of class sf
+    column_name = "iso3", # the column name of the regions in geo_site sf object and/or in xy_sf
+    add = T,   # if add = T, the arcs and only the arcs will printed on the existing device
+    type = "barchart", # if T plot barplot for outloflows/inflows and intra flows
+    xy_sf = st_centroid(world_crs, of_largest_polygon=TRUE), # possibility to give different coordinates of the starting and ending flows (by default, it corresponds to the centroid of geo_site)
+    select_o = NULL, # the origin sites to print
+    select_d = NULL, # the destination site to print
+    select_bar = countries_ct, # the sites to print the barplot
+    select_flows =NULL, # a vector of logical of size N indicating the flows to be printed
+    col_site = NULL, # a vector of colors with attribute names equal to the name of the sites
+    transparency = list(alpha = c(0.05, 0.6, 1), 
+                      range = c(0, 100000, max(y))), # two scalars to define the values of the minimum and maximum transparency
+    width_arc = c(0.2, max(y)), # a flow equals to max(flows) is represented by an arc of width 1 
+    size_head_arc = 1, # the size of the ending and starting of the arrows
+    reduce_arc = 0.9, # the percentage of reduction of the flow
+    percent_arc = 0.1, # the percentage of flows to represent
+    width_bar = 0.7, # the width of the barplot
+    lwd_bar = 0.1,   # the lwd of the bar
+    percent_bar = 1, # the percentage of barplot to print
+    col_direction = "none", # a character among "outflows", "inflows", "none"; by default, the outflows will be plotted in color
+    col_geometry = "lightgrey",  # color inside the polygons
+    border_geometry = "white", # color of the contours 
+    lwd_geometry = 0.5, # width of the contours,
+    print_names = F, # print the names of the sites on the map
+    size_names = 1, # size of the names if printed
+    print_legend = T, # legend for the width of the flows
+    pos_legend = "bottomright", # position of the legend
+    values_legend = c(100000, 200000, 500000), # values of the flows to be printed on the legend
+    size_legend = 0.7, # size of the characters in the legend
+    horiz_legend = F, # by default vertical
+    title_legend = "Flows", # the name of the legend
+    digit_legend = 2, # number of digits to keep in legend
+    bezier = F
+    )
+        
+ #dev.off()
+}
+```
+
+
+# Model estimation  and impact decomposition
+
+We now illustrate the estimation of both SLX and SDM models.  
+
+## SLX  
+
+The SLX (Spatial Lag of X) model is estimated using a standard ordinary least squares (OLS) regression.  
+Spatial dependence is incorporated by explicitly adding spatially lagged explanatory variables among the covariates.  
+In practice, this can be implemented with the `lm()` function in R, once the lagged variables have been constructed.  
+This approach allows us to capture the influence of neighboring conditions without modeling feedback effects through the dependent variable.  
+
+```{r}
+vars_included <- c("hwf", "dry")
+#vars_included <- "hwf" 
+
+var_controls <-  c("Lpop_O", "Lpop_D", "HDI_O", "HDI_D",  # LGDP_O + LGDP_D +                         "Lunemp_O", "Lunemp_D", 
+                   "politicalstability_O", "politicalstability_D",
+                   "class_conflict_O", "class_conflict_D", 
+                   "log(1 + y_1)", "log(1 + g)", "contig", "comlang", "colony") 
+var_controls_2 <-  c("Lpop_O", "Lpop_D", "HDI_O", "HDI_D",  # LGDP_O + LGDP_D +                         "Lunemp_O", "Lunemp_D", 
+                   "politicalstability_O", "politicalstability_D",
+                   "class_conflict_O", "class_conflict_D", 
+                   "log(1 + g)", "contig", "comlang", "colony") 
+
+var_climate <- paste0(c("", "", "Lag_", "Lag_"),
+                      rep(vars_included, each = 4),
+                      c("_O", "_D", "_O", "_D"))
+
+form_str <- paste("log(1 + y) ~",
+                  paste(c(var_climate, var_controls), collapse = " + "))
+form_str_2 <- paste("log(1 + y) ~",
+                  paste(c(var_climate, var_controls_2), collapse = " + "))
+
+my_formula <- as.formula(form_str)
+my_formula_2 <- as.formula(form_str_2)
+```
+
+Result for specification 1: 
+```{r}
+spec_1 <- lm(my_formula_2, data = pairs_od_without_intra)
+sum_spec_1 <- summary(spec_1)
+sum_spec_1
+```
+
+Result for specification 2: 
+```{r}
+spec_2 <- lm(my_formula, data = pairs_od_without_intra)
+sum_reg <- summary(spec_2)
+sum_reg
+```
+
+
+```{r, eval = F, echo = F }
+hat_y <- (predict(spec_2, newdata = pairs_od_without_intra))
+hat_y <- exp(predict(spec_2, newdata = pairs_od_without_intra))
+
+##
+#> Error in clog(MED_INCOME): could not find function "clog"
+res_impacts_slx <- data.frame(
+  var = rep(vars_included, each = length(world_iso_3$iso3)), 
+  iso3 = rep(world_iso_3$iso3, times = length(vars_included)),
+  origi_effect = 0,
+  desti_effect = 0,
+  network_effect = 0,
+  total_effect = 0)
+
+ind_inc <- 1 
+for(vars in vars_included) {
+  cat("\n", vars, "\n")
+  for(ind_cnty in 1:230) {
+    ind_iso <- res_impacts_slx$iso3[ind_cnty]
+    ind_neighbours <- which(mat_out[, ind_cnty] > 0)
+    
+    temp_X <- pairs_od_without_intra
+    temp_X[temp_X$cont_o == ind_iso, paste0(vars, "_O")] <- 
+      temp_X[temp_X$cont_o == ind_iso, paste0(vars, "_O")] * 1.01 
+    temp_X[temp_X$cont_d == ind_iso, paste0(vars, "_D")] <- 
+      temp_X[temp_X$cont_d == ind_iso, paste0(vars, "_D")] + 1 
+    
+    for(l in 1:length(ind_neighbours)) {
+      temp_X[temp_X$cont_o %in% world_iso_3$iso3[ind_neighbours[l]], 
+           paste0("Lag_", vars, "_O")] <- 
+        temp_X[temp_X$cont_o %in% world_iso_3$iso3[ind_neighbours[l]], 
+           paste0("Lag_", vars, "_O")] + OW[ind_neighbours[l], ind_cnty]
+      temp_X[temp_X$cont_d %in% world_iso_3$iso3[ind_neighbours[l]], 
+           paste0("Lag_", vars, "_D")] <- 
+        temp_X[temp_X$cont_d %in% world_iso_3$iso3[ind_neighbours[l]], 
+           paste0("Lag_", vars, "_D")] + OW[ind_neighbours[l], ind_cnty]
+    }
+    
+  hat_y_p <- exp(predict(spec_2, newdata = temp_X))
+  
+  #par(mfrow = c(1, 3))
+  temp_diff <- (hat_y_p - hat_y) / hat_y
+  # origin effect
+  all_OE <- temp_diff[which(substr(pairs_od_without_intra$cont_o, 1, 3) == ind_iso)]
+  OE <- sum(all_OE)
+  #hist(all_OE)
+  #lines(density(all_OE), col = "red", lty = 2)
+  # destination effect
+  all_DE <- temp_diff[which(substr(pairs_od_without_intra$cont_d, 1, 3) == ind_iso)]
+  DE <- sum(all_DE)
+  #hist(all_DE)
+  #lines(density(all_DE), col = "red", lty = 2)
+  # network effect
+  all_NE <- temp_diff[which(substr(pairs_od_without_intra$cont_o, 1, 3) != ind_iso & 
+                      substr(pairs_od_without_intra$cont_d, 1, 3) != ind_iso)]
+  #hist(all_NE)
+  #lines(density(all_NE), col = "red", lty = 2)
+  TE <- sum(temp_diff)
+  NE <- TE - DE - OE
+  
+  res_impacts_slx[ind_inc, -c(1, 2)] <- c(OE, DE , NE, TE)
+  
+  cat(ind_iso, "// O: ", OE, " D: ", DE , " NE: ", NE, " TE: ", TE, "Neighbours:", 
+      length(ind_neighbours), "\n")
+  
+  ind_inc <- ind_inc + 1 
+  }
+}
+```
+
+We now reproduce the Moran scatter plot shown in Figure C.7.  
+```{r, fig.width = 12, fig.height = 4}
+mat_out <- listw2mat(nb2listw(nb_out))
+# Moran scatter plot  
+res_1 <- log(1 + pairs_od_without_intra$y) - 
+  predict(spec_2, newdata = pairs_od_without_intra)
+N <- nrow(pairs_od_without_intra)
+Woy <- numeric(N)
+Wdy <- numeric(N)
+Wwy <- numeric(N)
+require("Matrix")
+Wo <- Matrix(0, N, N)
+Wd <- Matrix(0, N, N)
+Ww <- Matrix(0, N, N)
+
+ for(k in 1:N) {
+   if(k %in% c(100, 1000, 10000, 20000))
+      cat("It works :", k)
+   ind_o <- pairs_od_without_intra$cont_o[k]
+   ind_d <- pairs_od_without_intra$cont_d[k]
+   # origin 
+    ind_iso_o <- which(world_iso_3$iso3 == ind_o)
+    ind_neighbours_o <- world_iso_3$iso3[which(mat_out[ind_iso_o, ] > 0)]
+    
+  # destination 
+    ind_iso_d <- which(world_iso_3$iso3 == ind_d)
+    ind_neighbours_d <- world_iso_3$iso3[which(mat_out[ind_iso_d, ] > 0)]
+    
+    # Wo
+    ind_temp <- which(pairs_od_without_intra$cont_o %in% ind_neighbours_o &
+                      pairs_od_without_intra$cont_d == ind_d)
+    Woy[k] <- mean(res_1[ind_temp])
+    if(length(ind_temp) > 0)
+      Wo[k, ind_temp] <- 1 / length(ind_temp)
+    
+    # Wd
+    ind_temp <- which(pairs_od_without_intra$cont_o == ind_o &
+      pairs_od_without_intra$cont_d %in% ind_neighbours_d)
+    Wdy[k] <- mean(res_1[ind_temp])
+    if(length(ind_temp) > 0)
+      Wd[k, ind_temp] <- 1 / length(ind_temp)
+    
+    # Ww
+    ind_temp <- which(pairs_od_without_intra$cont_o %in% ind_neighbours_o &
+      pairs_od_without_intra$cont_d %in% ind_neighbours_d)
+    Wwy[k] <- mean(res_1[ind_temp])
+    if(length(ind_temp) > 0)
+      Ww[k, ind_temp] <- 1 / length(ind_temp)
+ }  
+
+#pdf("figures/moran_plot.pdf", width = 12, height = 4)
+par(mfrow = c(1, 3), las = 1, mgp = c(2.3, 1, 0),
+    oma = c(0, 0, 0, 0), mar = c(3.5, 4, 0.5, 0.5))
+plot(res_1, Woy, xlab = "SLX residuals", ylab = "Wo x residuals",
+     ylim = c(-5, 5), xlim = c(-5, 5))
+abline(h = mean(Woy, na.rm = T), lty = 2, col = "lightgrey")
+abline(v = 0, lty = 2, col = "lightgrey")
+abline(coefficients(lm(Woy ~ res_1)), col = "red", lty = 1)
+
+plot(res_1, Wdy, xlab = "SLX residuals", ylab = "Wd x residuals",
+     ylim = c(-5, 5), xlim = c(-5, 5))
+abline(h = mean(Wdy, na.rm = T), lty = 2, col = "lightgrey")
+abline(v = 0, lty = 2, col = "lightgrey")
+abline(coefficients(lm(Wdy ~ res_1)), col = "red", lty = 1)
+
+plot(res_1, Wwy, xlab = "SLX residuals", ylab = "Ww x residuals",
+     ylim = c(-5, 5), xlim = c(-5, 5))
+abline(h = mean(Wwy, na.rm = T), lty = 2, col = "lightgrey")
+abline(v = 0, lty = 2, col = "lightgrey")
+abline(coefficients(lm(Wwy ~ res_1)), col = "red", lty = 1)
+# dev.off()
+```
+
+The following code also performs a Monte Carlo permutation test to assess the significance of Moran’s $I$ statistic.  
+
+```{r, eval = F}
+moran.mc(res_1, mat2listw(Wo), nsim = 1000, zero.policy=T)
+moran.mc(res_1, mat2listw(Wd), nsim = 1000, zero.policy=T)
+moran.mc(res_1, mat2listw(Ww), nsim = 1000, zero.policy=T)
+```
+
+
+```{r, eval = F}
+library(rpart)  #library for CART
+library(rpart.plot)
+library(caret)
+t1 <- rpart(my_formula,
+            data = pairs_od_without_intra, 
+            method = "anova",         #indicates the outcome is continuous
+            control = rpart.control(
+                       minsplit = 1,  # min number of observ for a split 
+                       minbucket = 1, # min nr of obs in terminal nodes
+                       cp=0)          #decrease in complex for a split 
+)
+
+prune.t1 <- prune(t1, cp=0.00005)   #prune the tree with cp=0.02
+printcp(prune.t1)
+
+rpart.plot(prune.t1)  
+```
+
+
+
+## SDM  
+
+The Spatial Durbin Model (SDM) extends the SLX by incorporating spatial lags of the dependent variable in addition to spatially lagged covariates.  
+This allows us to capture endogenous feedback effects, where flows between two countries may be influenced not only by their characteristics but also by flows in neighboring origin and destination countries.  
+
+We estimate the SDM using the **spflow** package, which is specifically designed for origin–destination data in non-Cartesian settings.  
+Unlike standard spatial econometrics packages that mainly target regional or lattice data, `spflow` handles flow data with separate spatial weight matrices for origins ($\mathbf{W_o}$), destinations ($\mathbf{W_d}$), and joint origin–destination neighborhoods ($\mathbf{W_w}$).  
+
+The estimation is performed by maximum likelihood, which jointly identifies:  
+- the coefficients associated with the explanatory variables, and  
+- the spatial autocorrelation parameters ($\rho_o$, $\rho_d$, $\rho_w$).  
+
+This framework is therefore particularly well suited for modeling international migration, where interdependencies across origins, destinations, and migration corridors play a central role.  
+
+```{r}
+library("spflow")
+# nb_out_5, nb_out_10, nb_out
+OW_2 <- nb2mat(nb_out_10)
+
+#par(oma = c(0, 0, 0, 0), mar = c(0, 0, 0, 0))
+#plot(st_geometry(world_iso_3))
+#plot(nb_out, st_coordinates(st_centroid(world_iso_3)), add = T)
+
+#pairs_od_without_intra <- pairs_od  %>%
+#   filter(y > 0) # , CONTINENT_O == "EUROPE") #, CONTINENT_O == "AFRICA") #  & CONTINENT_O =="EUROPE")  #  & CONTINENT_O == "ASIA") # CONTINENT_O == "AMERICAS") #  filter(cont_o != cont_d)  # %>%  filter(CONTINENT_O == "AMERICA")
+
+mig_net <- spflow_network(
+  "world",
+  OW,
+  world_iso_3,
+  "iso3")
+
+mig_net_2 <- spflow_network(
+  "world",
+  OW_2,
+  world_iso_3,
+  "iso3")
+
+mig_net_pairs <- spflow_network_pair(
+  id_orig_net = "world",
+  id_dest_net = "world",
+  pair_data = pairs_od_without_intra[, c("cont_o", "cont_d", "y", "y_1", "g", "contig",
+                                     "comlang", "colony", "class_conflict_O",
+                                     "class_conflict_D")],
+  orig_key_column = "cont_o",
+  dest_key_column = "cont_d")
+
+mig_multinet <- spflow_network_multi(mig_net, mig_net_pairs)
+mig_multinet_2 <- spflow_network_multi(mig_net_2, mig_net_pairs)
+
+# define the model that we use to explain the flows...
+# ... D_() contains destination variables
+# ... O_() contains origin variables
+# ... D_() contains intra-regional variables (when origin == destination)
+# ... P_() contains pair variables (distances)
+flow_formula <-
+  log(1 + y) ~
+  D_(hwf + dry + Lpop + HDI + politicalstability) +
+  O_(hwf + dry + Lpop + HDI + politicalstability) +
+  P_(log(1 + g) + log(1 + y_1) + colony + contig + comlang + 
+       class_conflict_O + class_conflict_D)
+
+# define what variables to use in an SDM specification
+# ... if not given all will be used
+sdm_formula <- ~ D_(hwf + dry) + O_(hwf + dry)
+# sdm_formula <- ~ D_() + O_()
+
+# define the list of control parameters
+estimation_control <- spflow_control(sdm_variables = sdm_formula,
+                                     model = "model_9",
+                                     use_intra = FALSE,
+                                     fitted_value_method = "BPI")
+
+# Estimate the model
+spec_3 <- spflow(flow_formula, mig_multinet, 
+                 estimation_control = estimation_control)
+spec_4 <- spflow(flow_formula, mig_multinet_2, 
+                 estimation_control = estimation_control)
+```
+
+Result of specification 3 (Table 3.6):
+```{r}
+spec_3
+```
+
+Result of specification 4 (Table 3.6):
+```{r}
+spec_4
+```
+
+We compute the mean squarred error presented in Table 3.6
+```{r}
+hat_y <- predict(spec_3)
+hat_y_2 <- predict(spec_4)
+
+mean((log(1 + pairs_od_without_intra$y) - predict(spec_1))^2)
+mean((log(1 + pairs_od_without_intra$y) - predict(spec_2))^2)
+mean((log(1 + pairs_od_without_intra$y) - hat_y$FITTED)^2)
+mean((log(1 + pairs_od_without_intra$y) - hat_y_2$FITTED)^2)
+```
+
+## Impact decomposition  
+
+To interpret the SDM results, we compute the **impact decomposition**, which separates the effects of explanatory variables into origin, destination, and network components.  
+This approach allows us to go beyond raw parameter estimates and assess how a change in a given covariate at a specific site propagates through the migration system.  
+
+Our procedure is as follows:  
+
+1. For each explanatory variable, we introduce a **fixed increment** (e.g., one additional dry day, one additional heatwave day, +0.0059 for HDI, +0.0444 for political stability, or a 1% increase in population).  
+2. The increment is applied at the appropriate location (origin, destination, or lagged versions for neighbors).  
+3. Using the estimated SDM, we compute the predicted flows under both the baseline and incremented scenarios.  
+4. The difference between the two predictions provides the **marginal impact** of the increment for each bilateral flow.  
+
+By aggregating these flow-level differences, we recover **local effects** for each country:  
+- $OE(s)$ (Origin Effects),  
+- $DE(s)$ (Destination Effects),  
+- $NE(s)$ (Network Effects), and  
+- $TE(s)$ (Total Effects).  
+
+This decomposition makes it possible to quantify not only how local shocks (e.g., a drought in country $s$) affect migration from or to that country, but also how neighboring countries are indirectly affected through spatial spillovers.  
+
+
+```{r}
+nom_vars <- c("hwf", "dry", "HDI", "politicalstability", "Lpop")
+```
+
+
+```{r, eval = F}
+res_impacts <-  data.frame(
+  var = rep(nom_vars, each = length(world_iso_3$iso3)), 
+  iso3 = rep(world_iso_3$iso3, times = length(nom_vars)),
+  Origin = 0,
+  Destination = 0,
+  Network = 0,
+  Total = 0)
+add_unit <- c(hwf = 1, dry = 1, HDI = 0.00593, politicalstability = 0.0443764)
+ind_inc <- 1
+for(k in nom_vars) {
+  for(ind_cnty in 1:230) {
+    ind_iso <- res_impacts$iso3[ind_cnty]
+    # add unit
+    my_X_plus_only_ind_cnty <- st_drop_geometry(world_iso_3)
+    if(k != "Lpop") {
+      my_X_plus_only_ind_cnty[ind_cnty, k] <- my_X_plus_only_ind_cnty[ind_cnty, k] + add_unit[k]
+    } else {
+      # elasticities for Lpop
+     my_X_plus_only_ind_cnty[ind_cnty, k] <- my_X_plus_only_ind_cnty[ind_cnty, k] * 1.01
+    }
+    my_X_plus_only_ind_cnty[, paste0("Lag_", k)] <-
+      lag.listw(nb2listw(nb_out), my_X_plus_only_ind_cnty[, k])
+    spec_3_change <- spec_3
+    spec_3_change@spflow_matrices$D_[, k] <- my_X_plus_only_ind_cnty[, k]
+    spec_3_change@spflow_matrices$O_[, k] <- my_X_plus_only_ind_cnty[, k]
+    
+    if(k %in% c("hwf", "dry")) {
+      spec_3_change@spflow_matrices$D_[, paste0(k , ".lag1")] <-
+        my_X_plus_only_ind_cnty[, paste0("Lag_", k)]
+      spec_3_change@spflow_matrices$O_[, paste0(k , ".lag1")] <-
+        my_X_plus_only_ind_cnty[, paste0("Lag_", k)]
+    }
+    
+    hat_y_p <- predict(spec_3_change)
+    temp_diff <- exp(hat_y_p$PREDICTION) - exp(hat_y$PREDICTION)
+    OE <- sum(temp_diff[
+      which(substr(pairs_od_without_intra$cont_o, 1, 3) == ind_iso)])
+    DE <- sum(temp_diff[
+      which(substr(pairs_od_without_intra$cont_d, 1, 3) == ind_iso)])
+    TE <- sum(temp_diff)
+    NE <- TE - DE - OE
+  
+    res_impacts[ind_inc, -c(1, 2)] <- c(OE, DE, NE, TE)
+    cat(c(world_iso_3$iso3[ind_cnty], " O: ", OE, " D: ", 
+          DE , " NE: ", NE, " TE: ", TE,"\n \n"))
+    
+  ind_inc <- ind_inc + 1
+  }
+}
+save(res_impacts, file = "result/res_impacts.RData")
+```
+
+
+```{r, echo = F}
+load("result/res_impacts.RData")
+```
+
+We first compute the summary impacts, reported in Table 3.7. 
+
+```{r}
+res_impacts %>% 
+  group_by(var) %>%
+  summarise(Origin = sum(Origin) / N,
+            Destination = sum(Destination) / N,
+            Network = sum(Network) / N,
+            Total = sum(Total) / N)
+```
+
+Then, for each decomposition component, namely OE(s), DE(s), NE(s), and TE(s), we construct a barplot displaying the ten largest local impacts.
+
+```{r, fig.height = 8, fig.width = 6}
+type_E <- c("Origin", "Destination", "Network", "Total")
+
+temp_pivot <- data.frame(country = character(),
+                         nom_country = character(),
+                         var = character(),
+                         impacts = numeric(),
+                         type = character(), 
+                         TOP = character()) 
+for(l in c("hwf", "dry")) {
+  for(k in type_E) {
+  temp_pivot <- rbind(temp_pivot,
+      res_impacts %>%
+        filter(var == l) %>%
+        rename(impacts = k) %>%
+        mutate(country = tolower(countrycode::countrycode(iso3, 
+                                      "iso3c", "iso2c")),
+         nom_country = countrycode::countrycode(iso3, 
+                                  "iso3c", "country.name")) %>%
+        arrange(-impacts) %>%
+        mutate(type = k) %>% 
+        select(country, nom_country, var, impacts, type) %>%
+        filter(impacts > quantile(impacts, 0.9) | 
+             impacts < quantile(impacts, 0.1)) %>%
+        mutate(TOP = c(rep("largest", 23), rep("lowest", 23)))
+)
+  }
+}
+
+# impacts Dry Total
+choice_var <- "dry"
+choice_var <- "hwf"
+
+
+for(choice_var in c("hwf", "dry")) {
+  for(l in 1:4) {
+df_plot <- res_impacts %>%
+  filter(var == choice_var) %>%
+  rename(impacts = l + 2) %>%
+  mutate(
+    country     = tolower(countrycode(iso3, "iso3c", "iso2c")),
+    nom_country = iso3 # countrycode(iso3, "iso3c", "country.name")
+  )
+
+# top et bottom
+df_top_bottom <- bind_rows(
+  slice_max(df_plot, impacts, n = 10),
+  slice_min(df_plot, impacts, n = 10)
+) %>%
+  arrange(impacts) %>%   # ordonner numériquement
+  mutate(
+    nom_country = factor(nom_country, levels = nom_country) # fixer l'ordre
+  )
+
+# insérer "..." au milieu
+mid_row <- tibble(
+  nom_country = "...",
+  impacts = NA_real_,
+  country = NA_character_
+)
+
+# combiner et refixer l'ordre
+df_final <- bind_rows(
+  slice_head(df_top_bottom, n = 10),
+  mid_row,
+  slice_tail(df_top_bottom, n = 10)
+) %>%
+  mutate(nom_country = factor(nom_country, levels = nom_country))
+
+# plot
+ggplot(df_final, aes(x = nom_country, y = impacts)) +
+  geom_col(na.rm = TRUE) +
+  geom_flag(aes(y = 0, country = country), na.rm = TRUE) +
+  coord_flip() +
+  theme_minimal() +
+  xlab("") + ylab("") +
+  ggtitle(paste0(type_E[l], " Effect (", choice_var, ")"))
+
+#ggsave(paste0(type_E[l], "_impacts_", choice_var, ".pdf"), 
+#       width = 5, height = 6)
+  }
+}
+```
+
+
+Map the effects: 
+```{r, fig.width = 12, fig.height = 7}
+final_indicator_b <- merge(final_indicator, res_impacts %>% 
+  filter(var == "hwf") %>%
+  select(-var) %>%
+  rename(hwf_Origin = Origin,
+         hwf_Destination = Destination,
+         hwf_Network = Network,
+         hwf_Total = Total), by = "iso3")
+final_indicator_b <- merge(final_indicator_b, res_impacts %>% 
+  filter(var == "dry") %>%
+  select(-var) %>%
+  rename(dry_Origin = Origin,
+         dry_Destination = Destination,
+         dry_Network = Network,
+         dry_Total = Total), by = "iso3")
+
+final_indicator_b <- st_transform(final_indicator_b, st_crs(sea))
+for(s in c("dry", "hwf")) {
+#  pdf(paste0("figures/map_", s, "_impact.pdf"), 
+#      width = 12 * 1.7, height = 6.7 * 1.6)      
+  par(mar = c(0, 1, 1, 0), mfrow = c(2, 2))
+
+  for(l in c("Total", "Origin", "Destination", "Network")) {
+    vec_temp <- st_drop_geometry(final_indicator_b)[, paste0(s, "_", l)]
+  ##############
+    if(l %in% c("Total", "Network")) {
+      my_mid <- 0
+      bk_1 <- round(classInt::classIntervals(vec_temp[vec_temp < my_mid], 4,
+                                           "kmeans")$brks,  digits = 6)
+      bk_2 <- round(classInt::classIntervals(vec_temp[vec_temp >= my_mid], 4,
+                                           "kmeans")$brks,  digits = 6)
+      bk <- c(bk_1[1:4], my_mid, bk_2[2:5]) 
+      bk[1] <- min(vec_temp)
+      bk[length(bk)] <- max(vec_temp)
+      pal1 <- rev(RColorBrewer::brewer.pal(8, "RdBu"))  
+      } else {
+        ##############
+        bk <- round(classInt::classIntervals(vec_temp, 9, "kmeans")$brks, digits = 6)
+        bk[1] <- min(vec_temp)
+        bk[length(bk)] <- max(vec_temp)
+        if(s == "hwf")
+          pal1 <- rev(RColorBrewer::brewer.pal(9, "Blues"))
+        else {
+          if(l == "Origin")
+            pal1 <- RColorBrewer::brewer.pal(9, "Reds")
+          else
+            pal1 <- rev(RColorBrewer::brewer.pal(9, "Blues"))
+        }
+      }
+    ###############
+      
+    ind <- findInterval(vec_temp, bk, all.inside = TRUE)
+    plot(st_geometry(final_indicator_b), col = pal1[ind], 
+         border = "lightgrey", pch = 15, cex = 0.5, lwd = 0.1)
+    # title("Consecutive Dry Day in 2024", line = -1.15)
+    plot(sea, col = scales::alpha("lightblue", 0.3), 
+         border = rgb(0.2, 0.2, 0.2), add = T)
+    
+    plot(st_geometry(world_union), add = T, border = rgb(0.2, 0.2, 0.2))
+    plot(long_sf, add = T, col = "lightgrey")
+    plot(lat_sf, add = T, col = "lightgrey")
+
+## parameters for legend
+    poly_leg_temp <- vector("list", length(bk) - 1)
+    for(k in 1:(length(bk) - 1)) {
+      poly_leg_temp[[k]] <- rbind(c(-10000000 + (k - 1) * 3000000, 9200000), 
+                              c(-10000000 + 1000000 + (k - 1) * 3000000, 9200000),
+                              c(-10000000 + 1000000 + (k - 1) * 3000000, 8900000),
+                              c(-10000000 + (k - 1) * 3000000, 8900000),
+                              c(-10000000 + (k - 1) * 3000000, 9200000))
+    }
+    poly_leg <- st_sfc(st_polygon(poly_leg_temp[1]))
+    for(k in 2:length(poly_leg_temp)) {
+      poly_leg <- c(poly_leg, st_sfc(st_polygon(poly_leg_temp[k])))
+    }
+    # legend
+    plot(poly_leg, col = pal1, add = T)
+    temp_coord <- st_coordinates(st_centroid(poly_leg))
+    bk_round <- round(bk, 1)
+    for(k in 1:length(poly_leg)) {
+      if(k == 1) {
+        my_text <- paste0("<", bk_round[2])
+        } else {
+          if(k == (length(bk) - 1)) {
+            my_text <- paste0(">=", bk_round[length(bk) - 1])
+            } else {
+              my_text <- paste0("[", bk_round[k], "; ", bk_round[k+1], "[")
+            }
+        }
+      text(temp_coord[k, 1], temp_coord[k, 2] + 10, my_text, pos = 3, cex = 0.7)
+    }
+    title(paste0(l, " impacts"), line = -1)
+  }
+#   dev.off()
+}
+```
+
+
+
+
+
